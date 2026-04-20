@@ -1,0 +1,21 @@
+<launch>
+
+    <arg name="robot_name" default="kobuki"/>
+
+    <node name="world2ned" pkg="tf" type="static_transform_publisher" args="0 0 0 0 0 0 world kobuki/base_footprint 100"/>
+
+    <param name="robot_description"
+        command="$(find xacro)/xacro '$(find kobuki_description)/urdf/kobuki_standalone.urdf.xacro' 
+                        mobile_base_namespace:=$(arg robot_name)"/>
+
+    <!-- combine joint values -->
+    <node name="robot_state_publisher" pkg="robot_state_publisher" type="robot_state_publisher"/>
+
+    <!-- send joint values -->
+    <node name="joint_state_publisher_gui" pkg="joint_state_publisher_gui" type="joint_state_publisher_gui">
+        <param name="use_gui" value="True"/>
+    </node>
+
+    <!-- Show in Rviz -->
+    <node name="rviz" pkg="rviz" type="rviz" args="-d $(find kobuki_description)/rviz/kobuki.rviz"/>
+</launch>

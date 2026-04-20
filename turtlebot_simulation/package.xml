@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+	<name>turtlebot_simulation</name>
+	<version>2.0.0</version>
+	<description>
+		turtlebot_simulation contains simulation setups for Kobuki, SwiftPro and the whole Turtlebot.
+	</description>
+	<author email="patryk.cieslak@udg.edu">Patryk Cieslak</author>
+	<maintainer email="patryk.cieslak@udg.edu">Patryk Cieslak</maintainer>
+	<license>BSD</license>
+
+	<buildtool_depend>ament_cmake</buildtool_depend>
+
+	<exec_depend>kobuki_description</exec_depend>
+	<exec_depend>swiftpro_description</exec_depend>
+	<exec_depend>turtlebot_description</exec_depend>
+	<exec_depend>stonefish_ros2</exec_depend>
+
+	<test_depend>ament_lint_auto</test_depend>
+	<test_depend>ament_lint_common</test_depend>
+
+  	<exec_depend>ros2launch</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

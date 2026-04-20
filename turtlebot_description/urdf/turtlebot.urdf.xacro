@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<robot name="turtlebot" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <xacro:arg name="mobile_base_namespace" default="turtlebot"/>
+  <xacro:arg name="manipulator_namespace" default="turtlebot/swiftpro"/>
+  
+  <!-- Include Kobuki -->
+  <xacro:include filename="$(find kobuki_description)/urdf/kobuki.urdf.xacro" />
+  <xacro:kobuki prefix="$(arg mobile_base_namespace)"/>
+
+  <!-- Include manipulator -->
+  <xacro:include filename="$(find swiftpro_description)/urdf/swiftpro.urdf.xacro" />
+  <xacro:swiftpro prefix="$(arg manipulator_namespace)"/>
+
+  <!-- Attach manipulators to base -->
+  <joint name="base_to_manipulator" type="fixed">
+    <parent link="$(arg mobile_base_namespace)/base_link" />
+    <child link="$(arg manipulator_namespace)/manipulator_base_link" />
+    <origin xyz="${0.0507-0.014} 0.0 0.0" rpy="0.0 0.0 1.5708" />
+  </joint>
+
+</robot>
