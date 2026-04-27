@@ -82,18 +82,18 @@ def generate_launch_description():
         ]),
 
         # Navigation 
-        # Node(
-        #     package='turtlebot_simulation',
-        #     executable='diff_drive_odometry.py',
-        #     name='diff_drive_odometry',
-        #     output='screen',
-        #     parameters=[{
-        #         'odom_frame': 'world_enu',
-        #         'base_frame': PathJoinSubstitution([LaunchConfiguration('robot_name'), 'base_footprint']),
-        #         'wheel_left_joint_name': PathJoinSubstitution([LaunchConfiguration('robot_name'), 'wheel_left_joint']),
-        #         'wheel_right_joint_name': PathJoinSubstitution([LaunchConfiguration('robot_name'), 'wheel_right_joint'])
-        #     }]
-        # ),
+        Node(
+            package='turtlebot_simulation',
+            executable='diff_drive_odometry.py',
+            name='diff_drive_odometry',
+            output='screen',
+            parameters=[{
+                'odom_frame': 'world_enu',
+                'base_frame': PathJoinSubstitution([LaunchConfiguration('robot_name'), 'base_footprint']),
+                'wheel_left_joint_name': PathJoinSubstitution([LaunchConfiguration('robot_name'), 'wheel_left_joint']),
+                'wheel_right_joint_name': PathJoinSubstitution([LaunchConfiguration('robot_name'), 'wheel_right_joint'])
+            }]
+        ),
 
         # Control
         Node(

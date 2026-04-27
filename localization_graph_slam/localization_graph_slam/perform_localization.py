@@ -2,54 +2,20 @@ import rclpy
 from rclpy.node import Node
 
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import JointState, Imu
+from sensor_msgs.msg import JointState, Imu, LaserScan
 from geometry_msgs.msg import PoseStamped, Twist, TransformStamped
-import numpy as np
 from tf2_ros import TransformBroadcaster
+from visualization_msgs.msg import MarkerArray
+
 import gtsam
 from gtsam.symbol_shorthand import L, X
 
-from visualization_msgs.msg import MarkerArray
 
+import numpy as np
 from math import atan2, sin, cos
 
-def quaternion_from_euler(roll, pitch, yaw):
-    """Helper to replace tf.transformations.quaternion_from_euler"""
-    cy = cos(yaw * 0.5)
-    sy = sin(yaw * 0.5)
-    cp = cos(pitch * 0.5)
-    sp = sin(pitch * 0.5)
-    cr = cos(roll * 0.5)
-    sr = sin(roll * 0.5)
-    return [
-        sr * cp * cy - cr * sp * sy,
-        cr * sp * cy + sr * cp * sy,
-        cr * cp * sy + sr * sp * cy,
-        cr * cp * cy - sr * sp * sy
-    ]
-
-def euler_from_quaternion(x, y, z, w):
-    """Helper to replace tf.transformations.euler_from_quaternion"""
-    t0 = +2.0 * (w * x + y * z)
-    t1 = +1.0 - 2.0 * (x * x + y * y)
-    roll_x = atan2(t0, t1)
-
-    t2 = +2.0 * (w * y - z * x)
-    t2 = +1.0 if t2 > +1.0 else t2
-    t2 = -1.0 if t2 < -1.0 else t2
-    pitch_y = np.arcsin(t2)
-
-    t3 = +2.0 * (w * z + x * y)
-    t4 = +1.0 - 2.0 * (y * y + z * z)
-    yaw_z = atan2(t3, t4)
-
-    return roll_x, pitch_y, yaw_z
-
-def quaternion_ned_to_enu(q):
-    # q is [x, y, z, w] in NED
-    q_enu = np.array([q[1], q[0], -q[2], q[3]], dtype=float)
-    return q_enu / np.linalg.norm(q_enu)
-
+from .utils import quaternion_from_euler, euler_from_quaternion, quaternion_ned_to_enu
+from .line_extraction import SplitAndMerge
 
 class GraphSlam(Node):
 
@@ -76,6 +42,7 @@ class GraphSlam(Node):
         # Defining node publisher and subcriber
         self.joint_states_sub = self.create_subscription(JointState, "/turtlebot/joint_states", self.joint_state_callback, 20)
         self.imu_sub = self.create_subscription(Imu, "/turtlebot/sensors/imu_data", self.recieve_imu, 20)
+        self.lidar_sub = self.create_subscription(LaserScan, "/turtlebot/scan", self.receive_lidar, 20)
         self.odom_ground_truth = self.create_subscription(Odometry, "/turtlebot/odom_ground_truth", self.recieve_odom_ground_truth, 20)
         self.odom_pub = self.create_publisher(Odometry, "/turtlebot/odom", 20)
         self.odom_ground_truth_enu_pub = self.create_publisher(Odometry, "/turtlebot/odom_ground_truth_enu", 20)
@@ -90,6 +57,10 @@ class GraphSlam(Node):
         self.imu_orientation = 0.0
         self.imu_covariance = np.zeros((1, 1))
 
+        # Initialize value and flag for LiDAR update
+        self.lidar_update_flag = False
+        self.lidar_covariance = np.array([[0.01**2, 0.0], [0.0, 0.01**2]])
+
         # Initialize relative pose and covariance accumulated
         self.rel_disp = np.zeros((3, 1))
         self.rel_cov = np.zeros((3, 3))
@@ -99,6 +70,18 @@ class GraphSlam(Node):
         self.graph = gtsam.NonlinearFactorGraph()
         self.i = 0
         self.initialize = True
+        self.key_frame_update = 20
+        self.num_min_key = 10
+        self.k = 0
+
+        # Initialize line extraction
+        self.line_extractor = SplitAndMerge(0.01)
+        self.polar_coordinates = []
+        self.polar_covariances = []
+
+        # Position of line feature in the map frame
+        self.line_feature_map = []
+        self.line_feature_cov_map = []
 
 
     # Function receive imu infomation data
@@ -115,7 +98,22 @@ class GraphSlam(Node):
 
         if not self.intialize_theta:
             self.theta = self.imu_orientation
-            self.intialize_theta = True
+            self.intialize_theta = True 
+
+    # Function receive lidar information data
+    def receive_lidar(self, msg):
+        # Transform lidar range and angle data to Cartesian coordinates and extract line segments
+        lidar_points = self.line_extractor.transform_lidar_to_cartesian(msg)
+        line_segments = []
+        line_segments = self.line_extractor.split(lidar_points, line_segments)
+        line_segments = self.line_extractor.merge(line_segments)
+
+        # Calculate polar coordinates and covariance of line segments
+        self.polar_coordinates = self.line_extractor.calculate_polar_coordinates(line_segments)
+        for line in line_segments:
+            cov_line = self.line_extractor.calculate_line_covariance(line)
+            self.polar_covariances.append(cov_line)
+        self.lidar_update_flag = True
     
     # Define motion model
     def f(self, wheel_velocity, dt):
@@ -223,35 +221,39 @@ class GraphSlam(Node):
         self.graph.add(gtsam.BetweenFactorPose2(pose_key_prev, pose_key_curr, rel_pos, OdometryNoise))
         self.graph.add(gtsam.PoseRotationPrior2D(pose_key_curr, gtsam.Rot2(zk[0,0]), gtsam.noiseModel.Isotropic.Sigma(1, sigma_heading)))
         self.initial.insert(pose_key_curr, gtsam.Pose2(xk_bar[0,0], xk_bar[1,0], xk_bar[2,0]))
-        
-        # Check update in the first time
-        if self.initialize == True:
-            optimizer = gtsam.LevenbergMarquardtOptimizer(self.graph, self.initial)
-            self.initial = optimizer.optimize()
-            self.initialize = False
-        
-        self.isam2.update(self.graph, self.initial)
+        self.k += 1
+        if self.i > self.num_min_key and self.k >= self.key_frame_update:
 
-        self.graph = gtsam.NonlinearFactorGraph()
-        self.initial = gtsam.Values()
+            self.k = 0
+            # Check update in the first time
+            if self.initialize == True:
+                optimizer = gtsam.LevenbergMarquardtOptimizer(self.graph, self.initial)
+                self.initial = optimizer.optimize()
+                self.initialize = False
 
-        full_graph = self.isam2.getFactorsUnsafe()
+            self.isam2.update(self.graph, self.initial)
 
-        results = self.isam2.calculateEstimate()
-        pose = results.atPose2(pose_key_curr)
-        xk = np.array([[pose.x()], [pose.y()], [pose.theta()]])
-        marginals = gtsam.Marginals(full_graph, results)
+            self.graph = gtsam.NonlinearFactorGraph()
+            self.initial = gtsam.Values()
 
-        all_keys = gtsam.KeyVector()
-        all_keys.append(pose_key_curr)
+            full_graph = self.isam2.getFactorsUnsafe()
 
-        Pk = marginals.jointMarginalCovariance(all_keys).fullMatrix()
+            results = self.isam2.calculateEstimate()
+            pose = results.atPose2(pose_key_curr)
+            xk = np.array([[pose.x()], [pose.y()], [pose.theta()]])
+            marginals = gtsam.Marginals(full_graph, results)
 
-        self.rel_disp = np.zeros((3, 1))
-        self.rel_cov = np.zeros((3, 3))
+            all_keys = gtsam.KeyVector()
+            all_keys.append(pose_key_curr)
 
+            Pk = marginals.jointMarginalCovariance(all_keys).fullMatrix()
+        else:
+            xk = xk_bar
+            Pk = Pk_bar
         # self.get_logger().info(f"Updated Pose: x={xk[0,0]:.4f}, y={xk[1,0]:.4f}, theta={xk[2,0]:.4f}")
         # self.get_logger().info(f"Current Pose: x={self.x:.4f}, y={self.y:.4f}, theta={self.theta:.4f}")
+        self.rel_disp = np.zeros((3, 1))
+        self.rel_cov = np.zeros((3, 3))
 
         return xk, Pk
 

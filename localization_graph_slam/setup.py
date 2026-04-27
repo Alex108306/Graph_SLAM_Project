@@ -25,6 +25,7 @@ setup(
     entry_points={
         'console_scripts': [
             'localization_graph_slam = localization_graph_slam.perform_localization:main',
+            'line_extraction = localization_graph_slam.line_extraction:main',
         ],
     },
 )
