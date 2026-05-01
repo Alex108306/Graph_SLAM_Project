@@ -37,3 +37,7 @@ def quaternion_ned_to_enu(q):
     # q is [x, y, z, w] in NED
     q_enu = np.array([q[1], q[0], -q[2], q[3]], dtype=float)
     return q_enu / np.linalg.norm(q_enu)
+
+def warp_angle(angle):
+    """Warp angle to [-pi, pi]"""
+    return (angle + np.pi) % (2 * np.pi) - np.pi

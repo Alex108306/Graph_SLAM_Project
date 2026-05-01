@@ -134,6 +134,8 @@ class SplitAndMerge:
         # Iteratively merge line segments until no more merges can be made
         while merge == True:
             merge = False
+            if len(line_segments) <= 1:
+                break
             for i in range(len(line_segments)-1):
                 line_1 = line_segments[i]
                 line_2 = line_segments[i+1]

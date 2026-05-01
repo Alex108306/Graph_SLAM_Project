@@ -14,8 +14,16 @@ from gtsam.symbol_shorthand import L, X
 import numpy as np
 from math import atan2, sin, cos
 
-from .utils import quaternion_from_euler, euler_from_quaternion, quaternion_ned_to_enu
+from .utils import quaternion_from_euler, euler_from_quaternion, quaternion_ned_to_enu, warp_angle
 from .line_extraction import SplitAndMerge
+from .data_association import DataAssociation
+
+def CartesianToPolar(cartesian_coordinate):
+    x_f = cartesian_coordinate[0]
+    y_f = cartesian_coordinate[1]
+    range_f = np.sqrt(x_f**2 + y_f**2)
+    theta_f = warp_angle(atan2(y_f, x_f))
+    return [range_f, theta_f]
 
 class GraphSlam(Node):
 
@@ -35,7 +43,6 @@ class GraphSlam(Node):
         self.x = 0.0
         self.y = 0.0
         self.theta = 0.0
-        # self.Pk = np.zeros((3, 3))
         self.Pk = np.diag([0.1, 0.1, 0.1])
         self.intialize_theta = False
 
@@ -52,14 +59,22 @@ class GraphSlam(Node):
         self.first_time = True
         self.last_time = self.get_clock().now()
 
+        # Initialize joint state buffer
+        self.joint_state_buffer = []
+        self.joint_state_time_buffer = []
+
         # Initialize value and flag for IMU update
         self.imu_update_flag = False
         self.imu_orientation = 0.0
-        self.imu_covariance = np.zeros((1, 1))
+        self.imu_covariance = np.array([[0.01**2]])
+        self.imu_buffer = []
+        self.imu_time_buffer = []
 
         # Initialize value and flag for LiDAR update
         self.lidar_update_flag = False
         self.lidar_covariance = np.array([[0.01**2, 0.0], [0.0, 0.01**2]])
+        self.line_buffer = []
+        self.line_time_buffer = []
 
         # Initialize relative pose and covariance accumulated
         self.rel_disp = np.zeros((3, 1))
@@ -82,7 +97,12 @@ class GraphSlam(Node):
         # Position of line feature in the map frame
         self.line_feature_map = []
         self.line_feature_cov_map = []
+        self.new_feature = 0
 
+        # Data association initialize
+        self.H = []
+        self.confidence_level = 0.95
+        self.data_association = None
 
     # Function receive imu infomation data
     def recieve_imu(self, msg):
@@ -94,7 +114,14 @@ class GraphSlam(Node):
         # Convert quaternion to Euler angles and extract yaw (theta)
         self.imu_orientation = euler_from_quaternion(orientation_enu[0], orientation_enu[1], orientation_enu[2], orientation_enu[3])[2]  # Adjust for initial orientation
         self.imu_covariance = np.array([[cov_orientation[8]]])  # Assuming covariance for yaw is at index 8
-        self.imu_update_flag = True
+        self.imu_update_flag = False
+
+        # Store IMU data in buffer
+        self.imu_buffer.append([self.imu_orientation, self.imu_covariance])
+        self.imu_time_buffer.append(self.get_clock().now().nanoseconds / 1e9)
+        if len(self.imu_buffer) > 20:  # Limit buffer size
+            self.imu_buffer.pop(0)
+            self.imu_time_buffer.pop(0)
 
         if not self.intialize_theta:
             self.theta = self.imu_orientation
@@ -109,11 +136,18 @@ class GraphSlam(Node):
         line_segments = self.line_extractor.merge(line_segments)
 
         # Calculate polar coordinates and covariance of line segments
-        self.polar_coordinates = self.line_extractor.calculate_polar_coordinates(line_segments)
+        polar_coordinates = self.line_extractor.calculate_polar_coordinates(line_segments)
+        polar_covariances = []
         for line in line_segments:
-            cov_line = self.line_extractor.calculate_line_covariance(line)
-            self.polar_covariances.append(cov_line)
+            cov_line = self.line_extractor.calculate_covariance_matrix(line)
+            polar_covariances.append(cov_line)
         self.lidar_update_flag = True
+
+        self.line_buffer.append([polar_coordinates, polar_covariances])
+        self.line_time_buffer.append(self.get_clock().now().nanoseconds / 1e9)
+        if len(self.line_buffer) > 20:  # Limit buffer size
+            self.line_buffer.pop(0)
+            self.line_time_buffer.pop(0)
     
     # Define motion model
     def f(self, wheel_velocity, dt):
@@ -176,6 +210,25 @@ class GraphSlam(Node):
     def Vk(self):
         return np.identity(1)
     
+    def PolarToCartesian(self, polar_coordinate):
+        range_f = polar_coordinate[0]
+        theta_f = polar_coordinate[1]
+        x_f = range_f * cos(theta_f)
+        y_f = range_f * sin(theta_f)
+        return np.array([x_f, y_f])
+    
+    def AddNewFeature(self):
+        num_feature = len(self.line_feature_map)
+        num_old_feature = num_feature - self.new_feature
+        for i in range(num_old_feature, num_feature):
+            polar_feature = self.line_feature_map[i]
+            cartesian_feature = self.PolarToCartesian(polar_feature)
+            polar_cov_feature = self.line_feature_cov_map[i]
+            noise_model = gtsam.noiseModel.Gaussian.Covariance(polar_cov_feature)
+            feature_key = gtsam.symbol('L', i)
+            self.graph.add(gtsam.PriorFactorPoint2(feature_key, gtsam.Point2(cartesian_feature[0], cartesian_feature[1]), noise_model))
+            self.initial.insert(feature_key, gtsam.Point2(cartesian_feature[0], cartesian_feature[1]))
+    
     # Prediction function
     def Prediction(self, wheel_velocity, dt):
         # Predict the position of the robot and the covariance
@@ -212,6 +265,7 @@ class GraphSlam(Node):
         Rk = self.imu_covariance
 
         # Update process
+        # Add pose factor to the graph
         self.i += 1
         rel_pos = gtsam.Pose2(self.rel_disp[0,0], self.rel_disp[1,0], self.rel_disp[2,0])
         OdometryNoise = gtsam.noiseModel.Gaussian.Covariance(self.rel_cov + 1e-7 * np.eye(3))  # Adding a small value to prevent zero covariance
@@ -219,9 +273,25 @@ class GraphSlam(Node):
         pose_key_prev = gtsam.symbol('X', self.i-1)
         pose_key_curr = gtsam.symbol('X', self.i)
         self.graph.add(gtsam.BetweenFactorPose2(pose_key_prev, pose_key_curr, rel_pos, OdometryNoise))
-        self.graph.add(gtsam.PoseRotationPrior2D(pose_key_curr, gtsam.Rot2(zk[0,0]), gtsam.noiseModel.Isotropic.Sigma(1, sigma_heading)))
+
+
+        if self.imu_update_flag:
+            self.graph.add(gtsam.PoseRotationPrior2D(pose_key_curr, gtsam.Rot2(zk[0,0]), gtsam.noiseModel.Isotropic.Sigma(1, sigma_heading)))
+            self.k += 1
+        
         self.initial.insert(pose_key_curr, gtsam.Pose2(xk_bar[0,0], xk_bar[1,0], xk_bar[2,0]))
-        self.k += 1
+
+        if self.lidar_update_flag:
+            # self.get_logger().info(f"Number of line features observed: {len(self.polar_coordinates)}")
+            for j in range(len(self.H)):
+                if self.H[j] != None:
+                    noise_model = gtsam.noiseModel.Gaussian.Covariance(self.polar_covariances[j])
+                    feature_key = gtsam.symbol('L', self.H[j])
+                    self.graph.add(gtsam.BearingRangeFactor2D(pose_key_curr, feature_key, gtsam.Rot2(self.polar_coordinates[j][1]), self.polar_coordinates[j][0], noise_model))
+            if len(self.H) > 0 and self.imu_update_flag == False:
+                self.k += 1
+
+
         if self.i > self.num_min_key and self.k >= self.key_frame_update:
 
             self.k = 0
@@ -245,13 +315,23 @@ class GraphSlam(Node):
 
             all_keys = gtsam.KeyVector()
             all_keys.append(pose_key_curr)
+            for j in range(len(self.line_feature_map)):
+                feature_key = gtsam.symbol('L', j)
+                all_keys.append(feature_key)
 
-            Pk = marginals.jointMarginalCovariance(all_keys).fullMatrix()
+            Pk_full = marginals.jointMarginalCovariance(all_keys).fullMatrix()
+            Pk = Pk_full[0:3, 0:3]
+            for j in range(len(self.line_feature_map)):
+                feature_key = gtsam.symbol('L', j)
+                catersian_feature = results.atPoint2(feature_key)
+                polar_feature = CartesianToPolar([catersian_feature[0], catersian_feature[1]])
+                self.get_logger().info(f"Feature {j}: Cartesian coordinates: ({catersian_feature[0]}, {catersian_feature[1]}), Polar coordinates: ({polar_feature[0]}, {polar_feature[1]})")
+                self.line_feature_map[j] = polar_feature
+                self.line_feature_cov_map[j] = Pk_full[3+2*j:3+2*j+2, 3+2*j:3+2*j+2]
         else:
             xk = xk_bar
             Pk = Pk_bar
-        # self.get_logger().info(f"Updated Pose: x={xk[0,0]:.4f}, y={xk[1,0]:.4f}, theta={xk[2,0]:.4f}")
-        # self.get_logger().info(f"Current Pose: x={self.x:.4f}, y={self.y:.4f}, theta={self.theta:.4f}")
+
         self.rel_disp = np.zeros((3, 1))
         self.rel_cov = np.zeros((3, 3))
 
@@ -284,11 +364,40 @@ class GraphSlam(Node):
         # Adding noise to the wheel encoder sensor
         wheel_velocity = np.array([[left_wheel_velocity], [right_wheel_velocity]]) + np.random.normal(np.zeros((2,1)), np.array([np.sqrt(self.covariance_wheel_encoder.diagonal())]).T)
 
+        current_time_in_sec = current_time.nanoseconds / 1e9
+        # Try to synchronize the latest IMU and LiDAR data with the current joint state data
+        if self.imu_update_flag and len(self.imu_time_buffer) > 0:
+            while len(self.imu_time_buffer) > 0 and abs(self.imu_time_buffer[0] - current_time_in_sec) > 0.001:
+                self.imu_time_buffer.pop(0)
+                self.imu_buffer.pop(0)
+            if len(self.imu_buffer) > 0:
+                # self.get_logger().info(f"IMU time difference: {abs(self.imu_time_buffer[0] - current_time_in_sec)}")
+                self.imu_orientation = self.imu_buffer[0][0]
+                self.imu_covariance = self.imu_buffer[0][1]
+            else:
+                self.imu_update_flag = False
+        
+        if self.lidar_update_flag and len(self.line_time_buffer) > 0:
+            while len(self.line_time_buffer) > 0 and abs(self.line_time_buffer[0] - current_time_in_sec) > 0.001:
+                self.line_time_buffer.pop(0)
+                self.line_buffer.pop(0)
+            if len(self.line_buffer) > 0:
+                # self.get_logger().info(f"LiDAR time difference: {abs(self.line_time_buffer[0] - current_time_in_sec)}")
+                self.polar_coordinates = self.line_buffer[0][0]
+                self.polar_covariances = self.line_buffer[0][1]
+            else:
+                self.lidar_update_flag = False
+
         # Predict pose of robot with covariance
         xk_bar, Pk_bar = self.Prediction(wheel_velocity, dt)
 
+        # Data association
+        if self.lidar_update_flag:
+            self.data_association = DataAssociation(self.confidence_level, self.line_feature_map, self.line_feature_cov_map)
+            self.H = self.data_association.DataAssociation(xk_bar, Pk_bar, self.polar_coordinates, self.polar_covariances)
+
         # Update function so use predict
-        if self.imu_update_flag == True:
+        if self.imu_update_flag == True or self.lidar_update_flag == True:
             xk, Pk = self.Update(xk_bar, Pk_bar)
             self.x = xk[0, 0]
             self.y = xk[1, 0]
@@ -300,7 +409,20 @@ class GraphSlam(Node):
             self.y = xk_bar[1, 0]
             self.theta = xk_bar[2, 0]
             self.Pk = Pk_bar
-    
+        
+        # Add new feature to the map
+        if self.lidar_update_flag:
+            unsociated_features, unsociated_features_cov = self.data_association.GetUnassociatedFeatures(self.polar_coordinates, self.polar_covariances, self.H)
+            self.new_feature = len(unsociated_features)
+            if len(unsociated_features) > 0:
+                xk = np.array([[self.x], [self.y], [self.theta]])
+                self.data_association.AddmultipleNewFeatures(xk, self.Pk, unsociated_features, unsociated_features_cov)
+                self.line_feature_map = self.data_association.map_feature
+                self.line_feature_cov_map = self.data_association.map_feature_cov
+                self.AddNewFeature()
+            self.lidar_update_flag = False
+
+        # self.get_logger().info(f"Number of features in the map: {len(self.line_feature_map)}")
         # Transfer from velocity wheel to robot velocity
         linear_velocity = 1/2 * self.radius_wheel * (wheel_velocity[0, 0] + wheel_velocity[1, 0])
         angular_velocity = (self.radius_wheel/self.base_length) * (-wheel_velocity[0, 0] + wheel_velocity[1, 0])
@@ -395,6 +517,7 @@ class GraphSlam(Node):
         odom_ground_truth_enu_msg.pose.covariance = cov.flatten().tolist()
 
         self.odom_ground_truth_enu_pub.publish(odom_ground_truth_enu_msg)
+
 
 
 
