@@ -268,7 +268,7 @@ class GraphSlam(Node):
         # Add pose factor to the graph
         self.i += 1
         rel_pos = gtsam.Pose2(self.rel_disp[0,0], self.rel_disp[1,0], self.rel_disp[2,0])
-        OdometryNoise = gtsam.noiseModel.Gaussian.Covariance(self.rel_cov + 1e-7 * np.eye(3))  # Adding a small value to prevent zero covariance
+        OdometryNoise = gtsam.noiseModel.Gaussian.Covariance(self.rel_cov)  # Adding a small value to prevent zero covariance
         sigma_heading = float(np.sqrt(Rk[0,0] + 1e-7))  # Adding a small value to prevent zero covariance
         pose_key_prev = gtsam.symbol('X', self.i-1)
         pose_key_curr = gtsam.symbol('X', self.i)
