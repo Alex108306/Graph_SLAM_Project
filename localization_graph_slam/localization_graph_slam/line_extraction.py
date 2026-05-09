@@ -84,7 +84,7 @@ class SplitAndMerge:
             List of line segments, where each line segment is represented by a tuple of two points (start_point, end_point)
         """
 
-        # If the number of points is less than or equal to 10, we consider it is not a line
+        # If the number of points is less than or equal to 20, we consider it is not a line
         if len(list_of_points) <= 10:
             return line_segments
 
@@ -212,14 +212,14 @@ class SplitAndMerge:
         Return:
             Covariance matrix of the line segment with respect to the robot local frame
         """
-        sigma_r = 0.01 # 1 cm
+        sigma_r = 0.07 # 1 cm
         cov_max_2D_point = np.array([[sigma_r**2, 0.0], [0.0, sigma_r**2]])
 
         line_params = self.fit_line(line[0], line[1])
         a, b, c = line_params
         dr_da = -abs(c) * a / math.sqrt((a**2 + b**2)**3)
         dr_db = -abs(c) * b / math.sqrt((a**2 + b**2)**3)
-        dr_dc = c / abs(c) * 1 / math.sqrt(a**2 + b**2)
+        dr_dc = math.copysign(1.0, c) / math.sqrt(a**2 + b**2)
         dtheta_da = -b / (a**2 + b**2)
         dtheta_db = a / (a**2 + b**2)
         da_dy1 = -1
