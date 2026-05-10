@@ -84,7 +84,7 @@ class SplitAndMerge:
             List of line segments, where each line segment is represented by a tuple of two points (start_point, end_point)
         """
 
-        # If the number of points is less than or equal to 20, we consider it is not a line
+        # If the number of points is less than or equal to 10, we consider it is not a line
         if len(list_of_points) <= 10:
             return line_segments
 
@@ -212,14 +212,14 @@ class SplitAndMerge:
         Return:
             Covariance matrix of the line segment with respect to the robot local frame
         """
-        sigma_r = 0.07 # 1 cm
+        sigma_r = 0.01 # 1 cm
         cov_max_2D_point = np.array([[sigma_r**2, 0.0], [0.0, sigma_r**2]])
 
         line_params = self.fit_line(line[0], line[1])
         a, b, c = line_params
         dr_da = -abs(c) * a / math.sqrt((a**2 + b**2)**3)
         dr_db = -abs(c) * b / math.sqrt((a**2 + b**2)**3)
-        dr_dc = math.copysign(1.0, c) / math.sqrt(a**2 + b**2)
+        dr_dc = c / abs(c) * 1 / math.sqrt(a**2 + b**2)
         dtheta_da = -b / (a**2 + b**2)
         dtheta_db = a / (a**2 + b**2)
         da_dy1 = -1
@@ -250,6 +250,43 @@ class LineExtractionNode(Node):
         self.create_timer(0.5, self.visualize_line_segments)
         self.lidar_points = None
         self.lidar_coordinate = "turtlebot/base_footprint"
+        self.confidence_chi2_2d_95 = 5.991464547107979
+
+    def _regularize_covariance(self, cov: np.ndarray, eps: float = 1e-9) -> np.ndarray:
+        cov_sym = 0.5 * (cov + cov.T)
+        return cov_sym + np.eye(2) * eps
+
+    def _curve_boundary_points(self, line: list, cov_line: np.ndarray, num_samples: int = 100) -> tuple:
+        start_point = np.array(line[0], dtype=float)
+        end_point = np.array(line[1], dtype=float)
+        line_vec = end_point - start_point
+        line_len = np.linalg.norm(line_vec)
+        if line_len <= 1e-9:
+            return [], []
+        samples_per_meter = 80.0
+        min_samples = 40
+        max_samples = 400
+        num_samples = int(np.clip(math.ceil(samples_per_meter * line_len), min_samples, max_samples))
+
+        tangent = line_vec / line_len
+        # Match the line normal convention used by fit_line / atan2(b, a).
+        normal = np.array([tangent[1], -tangent[0]])
+        theta = math.atan2(normal[1], normal[0])
+
+        cov_reg = self._regularize_covariance(cov_line)
+        samples_s = np.linspace(0.0, line_len, num_samples)
+        boundary_plus = []
+        boundary_minus = []
+        for s in samples_s:
+            point_nominal = start_point + s * tangent
+            jacobian = np.array([1.0, point_nominal[0] * math.sin(theta) - point_nominal[1] * math.cos(theta)])
+            variance_dist = float(jacobian @ cov_reg @ jacobian.T)
+            variance_dist = max(variance_dist, 0.0)
+            confidence_dist = math.sqrt(self.confidence_chi2_2d_95 * variance_dist)
+            boundary_plus.append(point_nominal + confidence_dist * normal)
+            boundary_minus.append(point_nominal - confidence_dist * normal)
+
+        return boundary_plus, boundary_minus
     
     def transform_lidar_to_cartesian(self, lidar_msg):
         """
@@ -343,6 +380,9 @@ class LineExtractionNode(Node):
         self.get_logger().info(f"{angle_list}")
         
         lines_visualization = MarkerArray()
+        clear_marker = Marker()
+        clear_marker.action = Marker.DELETEALL
+        lines_visualization.markers.append(clear_marker)
         for i, line in enumerate(line_segments):
             marker = Marker()
             marker.header.frame_id = self.lidar_coordinate
@@ -417,6 +457,38 @@ class LineExtractionNode(Node):
                     marker.points.append(Point(x=q1[0], y=q1[1], z=0.0))
                     marker.points.append(Point(x=q2[0], y=q2[1], z=0.0))
                     lines_visualization.markers.append(marker)
+
+            boundary_plus, boundary_minus = self._curve_boundary_points([start_point, end_point], cov_line)
+            if len(boundary_plus) > 1 and len(boundary_minus) > 1:
+                marker = Marker()
+                marker.header.frame_id = self.lidar_coordinate
+                marker.header.stamp = self.get_clock().now().to_msg()
+                marker.ns = "line_uncertainty_curve"
+                marker.id = 3000 * i
+                marker.type = Marker.LINE_STRIP
+                marker.action = Marker.ADD
+                marker.scale.x = 0.02
+                marker.color.a = 0.85
+                marker.color.r = 1.0
+                marker.color.g = 0.85
+                marker.color.b = 0.0
+                marker.points = [Point(x=float(p[0]), y=float(p[1]), z=0.0) for p in boundary_plus]
+                lines_visualization.markers.append(marker)
+
+                marker = Marker()
+                marker.header.frame_id = self.lidar_coordinate
+                marker.header.stamp = self.get_clock().now().to_msg()
+                marker.ns = "line_uncertainty_curve"
+                marker.id = 3000 * i + 1
+                marker.type = Marker.LINE_STRIP
+                marker.action = Marker.ADD
+                marker.scale.x = 0.02
+                marker.color.a = 0.85
+                marker.color.r = 1.0
+                marker.color.g = 0.85
+                marker.color.b = 0.0
+                marker.points = [Point(x=float(p[0]), y=float(p[1]), z=0.0) for p in boundary_minus]
+                lines_visualization.markers.append(marker)
         
         self.line_array_pub_.publish(lines_visualization)
 
