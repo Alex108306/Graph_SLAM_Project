@@ -47,29 +47,53 @@ ros2 run localization_graph_slam line_extraction
 ```
 
 
-
-
-cd /home/elchina/Documents/HOL_project/Graph_SLAM_Project
+cd /home/elchina/Documents/HOL_project/Graph_SLAM_Project_tomerge
+source /home/elchina/Documents/HOL_project/.venv-gtsam43/bin/activate
 source /opt/ros/jazzy/setup.bash
 source install/setup.bash
 ros2 launch turtlebot_simulation turtlebot_hoi_circuit1.launch.py
 
-cd /home/elchina/Documents/HOL_project/Graph_SLAM_Project
+cd /home/elchina/Documents/HOL_project/Graph_SLAM_Project_tomerge
+source /home/elchina/Documents/HOL_project/.venv-gtsam43/bin/activate
 source /opt/ros/jazzy/setup.bash
 source install/setup.bash
-ros2 run localization_graph_slam line_extraction
+python -m localization_graph_slam.line_extraction
 
-cd /home/elchina/Documents/HOL_project/Graph_SLAM_Project
+cd /home/elchina/Documents/HOL_project/Graph_SLAM_Project_tomerge
+source /home/elchina/Documents/HOL_project/.venv-gtsam43/bin/activate
 source /opt/ros/jazzy/setup.bash
 source install/setup.bash
-ros2 run localization_graph_slam localization_graph_slam
+python -m localization_graph_slam.perform_localization
 
-
-cd /home/elchina/Documents/HOL_project/Graph_SLAM_Project
+cd /home/elchina/Documents/HOL_project/Graph_SLAM_Project_tomerge
+source /home/elchina/Documents/HOL_project/.venv-gtsam43/bin/activate
 source /opt/ros/jazzy/setup.bash
 source install/setup.bash
-ros2 run teleop_twist_keyboard teleop_twist_keyboard
-
-
-
 ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -r __ns:=/turtlebot
+
+
+
+
+
+
+---------------------------------------
+
+cd /home/elchina/Documents/HOL_project/Graph_SLAM_Project_tomerge
+source /home/elchina/Documents/HOL_project/.venv-gtsam43/bin/activate
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+ros2 launch turtlebot_simulation turtlebot_hoi_circuit1.launch.py
+
+
+cd /home/elchina/Documents/HOL_project/Graph_SLAM_Project_tomerge
+source /home/elchina/Documents/HOL_project/.venv-gtsam43/bin/activate
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+python -m localization_graph_slam.line_extraction
+
+
+cd /home/elchina/Documents/HOL_project/Graph_SLAM_Project_tomerge
+source /home/elchina/Documents/HOL_project/.venv-gtsam43/bin/activate
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+python -m localization_graph_slam.perform_localization

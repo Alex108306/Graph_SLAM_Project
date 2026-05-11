@@ -496,3 +496,7 @@ def main(args=None):
     # Clean up and shutdown ROS 2
     line_extraction_node.destroy_node()
     rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

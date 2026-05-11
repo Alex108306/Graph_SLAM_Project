@@ -3,9 +3,9 @@ from rclpy.node import Node
 
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import JointState, Imu, LaserScan
-from geometry_msgs.msg import PoseStamped, Twist, TransformStamped
+from geometry_msgs.msg import PoseStamped, Twist, TransformStamped, Point
 from tf2_ros import TransformBroadcaster
-from visualization_msgs.msg import MarkerArray
+from visualization_msgs.msg import MarkerArray, Marker
 
 import gtsam
 from gtsam.symbol_shorthand import L, X
@@ -53,6 +53,7 @@ class GraphSlam(Node):
         self.odom_ground_truth = self.create_subscription(Odometry, "/turtlebot/odom_ground_truth", self.recieve_odom_ground_truth, 20)
         self.odom_pub = self.create_publisher(Odometry, "/turtlebot/odom", 20)
         self.odom_ground_truth_enu_pub = self.create_publisher(Odometry, "/turtlebot/odom_ground_truth_enu", 20)
+        self.visualize_map_pub = self.create_publisher(MarkerArray, "/turtlebot/line_features_map", 20)
         self.tf_br = TransformBroadcaster(self)
 
         # Initialize the clock and the last time variable
