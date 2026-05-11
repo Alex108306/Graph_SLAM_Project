@@ -9,6 +9,7 @@ import numpy as np
 import math
 
 from scipy.linalg import block_diag
+from .utils import warp_angle
 
 class SplitAndMerge:
     def __init__(self, distance_threshold: float):
@@ -84,8 +85,8 @@ class SplitAndMerge:
             List of line segments, where each line segment is represented by a tuple of two points (start_point, end_point)
         """
 
-        # If the number of points is less than or equal to 20, we consider it is not a line
-        if len(list_of_points) <= 10:
+        # If the number of points is less than or equal to 15, we consider it is not a line
+        if len(list_of_points) <= 15:
             return line_segments
 
         start_point = list_of_points[0]
@@ -112,78 +113,69 @@ class SplitAndMerge:
             line_segments.append(line_segment)
         
         return line_segments
-    
+
     def merge(self, line_segments: list) -> list:
         """
         Merge the line segments that are approximately collinear
 
         Args:
-            line_segments: List of line segments, where each line segment is represented by a tuple of two points (start_point, end_point)
+            line_segments: List of line segments, where each line segment is
+            represented by [start_point, end_point]
 
         Return:
-            List of merged line segments, where each line segment is represented by a tuple of two points (start_point, end_point)
+            List of merged line segments
         """
 
-        # Initialize parameters for merging lines
-        angle_approve_merge = 0.087 # 5 degree in radian
-        distance_threshold_between_lines = 0.05 # 5 cm
-        merged_line_segments = []
-        final_line_merge = False
-        merge = True
+        angle_approve_merge = 0.087  # 5 degrees in radians
+        distance_threshold_between_lines = 0.05  # 5 cm
 
-        # Iteratively merge line segments until no more merges can be made
-        while merge == True:
-            merge = False
-            if len(line_segments) <= 1:
-                break
-            for i in range(len(line_segments)-1):
-                line_1 = line_segments[i]
-                line_2 = line_segments[i+1]
-                line_1_params = self.fit_line(line_1[0], line_1[1])
-                line_2_params = self.fit_line(line_2[0], line_2[1])
-                distance_line_1 = self.distance_from_line([0.0, 0.0], line_1_params)
-                distance_line_2 = self.distance_from_line([0.0, 0.0], line_2_params)
-                # Calculate the distance from the origin to each line and compare the difference with the threshold to determine if they are close enough to be merged
-                diff_distance = abs(distance_line_1 - distance_line_2) # 
-                if diff_distance < distance_threshold_between_lines:
-                    angle_diff = abs(math.atan2(line_1_params[1], line_1_params[0]) - math.atan2(line_2_params[1], line_2_params[0]))
-                    if angle_diff < angle_approve_merge:
-                        merge = True
-                        merged_line_segments.append([line_1[0], line_2[1]])
-                    else:
-                        merged_line_segments.append(line_1)
-                else:
-                    merged_line_segments.append(line_1)
-                
-                if i == len(line_segments) - 1 and merge == True:
-                    final_line_merge = True
-            
-            # Handle the case where the last line segment and the first line segment can be merged to form a closed loop
-            if final_line_merge == True:
-                line_1 = merged_line_segments[-1]
-                line_2 = merged_line_segments[0]
-            else:
-                line_1 = line_segments[-1]
-                line_2 = merged_line_segments[0]
+        def can_merge(line_1, line_2):
             line_1_params = self.fit_line(line_1[0], line_1[1])
             line_2_params = self.fit_line(line_2[0], line_2[1])
+
             distance_line_1 = self.distance_from_line([0.0, 0.0], line_1_params)
             distance_line_2 = self.distance_from_line([0.0, 0.0], line_2_params)
             diff_distance = abs(distance_line_1 - distance_line_2)
-            if diff_distance < distance_threshold_between_lines:
-                angle_diff = abs(math.atan2(line_1_params[1], line_1_params[0]) - math.atan2(line_2_params[1], line_2_params[0]))
-                if angle_diff < angle_approve_merge:
-                    merged_line_segments[0] = [line_1[0], line_2[1]]
-                    merge = True
-                else: 
-                    merged_line_segments.append(line_1)
-            else:
-                merged_line_segments.append(line_1)
-            
-            line_segments = merged_line_segments
-            merged_line_segments = []
-        
-        return line_segments
+            if diff_distance >= distance_threshold_between_lines:
+                return False
+
+            angle_1 = math.atan2(line_1_params[1], line_1_params[0])
+            angle_2 = math.atan2(line_2_params[1], line_2_params[0])
+            angle_diff = abs(math.atan2(math.sin(angle_1 - angle_2), math.cos(angle_1 - angle_2)))
+
+            return angle_diff < angle_approve_merge
+
+        if len(line_segments) <= 1:
+            return line_segments
+
+        current_segments = list(line_segments)
+
+        while True:
+            changed = False
+            merged_segments = []
+            i = 0
+
+            while i < len(current_segments):
+                if i < len(current_segments) - 1 and can_merge(current_segments[i], current_segments[i + 1]):
+                    merged_segments.append([current_segments[i][0], current_segments[i + 1][1]])
+                    changed = True
+                    i += 2
+                else:
+                    merged_segments.append(current_segments[i])
+                    i += 1
+
+            # Optional closed-loop merge: merge last and first if they are compatible
+            if len(merged_segments) > 1 and can_merge(merged_segments[-1], merged_segments[0]):
+                merged_segments[0] = [merged_segments[-1][0], merged_segments[0][1]]
+                merged_segments.pop()
+                changed = True
+
+            current_segments = merged_segments
+
+            if not changed:
+                break
+
+        return current_segments
         
     def calculate_polar_coordinates(self, line_segments: list) -> list:
         """
@@ -196,10 +188,10 @@ class SplitAndMerge:
         
         polar_coordinates = []
 
-        for line in line_segments:
+        for i, line in enumerate(line_segments):
             line_params = self.fit_line(line[0], line[1])
             distance = self.distance_from_line([0.0, 0.0], line_params)
-            angle = math.atan2(line_params[1], line_params[0])
+            angle = warp_angle(math.atan2(line_params[1], line_params[0]) - np.pi)
             polar_coordinates.append([distance, angle])
 
         return polar_coordinates
@@ -212,7 +204,7 @@ class SplitAndMerge:
         Return:
             Covariance matrix of the line segment with respect to the robot local frame
         """
-        sigma_r = 0.07 # 1 cm
+        sigma_r = 0.07 # 30 cm
         cov_max_2D_point = np.array([[sigma_r**2, 0.0], [0.0, sigma_r**2]])
 
         line_params = self.fit_line(line[0], line[1])
@@ -318,7 +310,7 @@ class LineExtractionNode(Node):
             marker.scale.z = 0.05
             marker.color.a = 1.0
             marker.color.r = 1.0
-            marker.color.g = 0.0
+            marker.color.g = 1.0
             marker.color.b = 0.0
             marker_array.markers.append(marker)
         

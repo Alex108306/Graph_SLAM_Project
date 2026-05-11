@@ -5,11 +5,12 @@ from .utils import warp_angle
 
 class DataAssociation:
 
-    def __init__(self, confidenve_level, map_feature, map_feature_cov):
+    def __init__(self, confidenve_level, map_feature, map_feature_cov, line_segments_map):
 
         self.confidenve_level = confidenve_level
         self.map_feature = map_feature
         self.map_feature_cov = map_feature_cov
+        self.map_line_segments = line_segments_map  # Initialize an empty list for line segments
         self.nf = len(map_feature)
         self.zfi_dim = 2
 
@@ -104,7 +105,13 @@ class DataAssociation:
         P_F = []
         for i in range(0, self.nf):
             h_Fi = self.hfj(xk, i)
-            P_Fi = self.Jhfjx(xk, i) @ Pk @ self.Jhfjx(xk ,i).T
+            Jx = self.Jhfjx(xk, i)
+            Jf = self.Jhfjf(xk, i)
+            Pf_map = self.map_feature_cov[i]
+
+            P_Fi = Jx @ Pk @ Jx.T + Jf @ Pf_map @ Jf.T
+            P_Fi = 0.5 * (P_Fi + P_Fi.T) + 1e-9 * np.eye(2)
+            # P_Fi = self.Jhfjx(xk, i) @ Pk @ self.Jhfjx(xk ,i).T
             h_F.append(h_Fi)
             P_F.append(P_Fi)
 
@@ -146,7 +153,33 @@ class DataAssociation:
 
         return Jhfjx
     
-    def AddNewFeature(self, xk, Pk, zfi, Rfi):
+    def Jhfjf(self, xk, j):
+        rho_f = self.map_feature[j][0]
+        alpha_f = self.map_feature[j][1]
+        x_robot, y_robot, _ = xk[0][0], xk[1][0], xk[2][0]
+
+        return np.array([
+            [1.0, sin(alpha_f) * x_robot - cos(alpha_f) * y_robot],
+            [0.0, 1.0]
+        ])
+    
+    def TransformLineSegmentToWorldFrame(self, line_segment, xk):
+        """
+        Transforms a line segment from the robot local frame to the world frame given the state vector :math:`x_k`.
+
+        :param line_segment: line segment in the robot local frame
+        :param xk: mean state vector including the robot pose
+        :return: line segment in the world frame
+        """
+        line_segment = np.array([[line_segment[0][0], line_segment[1][0]],
+                                 [line_segment[0][1], line_segment[1][1]]])  # Reshape to 2x2 array
+        x_robot, y_robot, theta_robot = xk[0][0], xk[1][0], xk[2][0]
+        R = np.array([[cos(theta_robot), -sin(theta_robot)], [sin(theta_robot), cos(theta_robot)]])
+        line_segment_world = R @ line_segment + np.array([[x_robot], [y_robot]])
+        line_segment_world = [[line_segment_world[0, 0], line_segment_world[1, 0]], [line_segment_world[0, 1], line_segment_world[1, 1]]]  # Reshape back to list of tuples
+        return line_segment_world  # Flatten to a 1D list and convert to Python list
+    
+    def AddNewFeature(self, xk, Pk, zfi, Rfi, line_segment):
         """
         Adds a new feature to the map given a feature observation :math:`z_{f_i}` and its covariance matrix :math:`R_{f_i}`. The new feature is added to the map if it has not been associated with any expected feature observation :math:`h_{f_j}`.
 
@@ -154,6 +187,7 @@ class DataAssociation:
         :param Pk: covariance matrix of the state vector
         :param zfi: feature observation
         :param Rfi: covariance matrix of the feature observation
+        :param line_segment: line segment corresponding to the feature observation
         """
         
         # Implement inverted sensor model
@@ -162,6 +196,7 @@ class DataAssociation:
         theta_obs = zfi[1]
         range_f = range_obs + cos(theta_obs + theta_robot) * x_robot + sin(theta_obs + theta_robot) * y_robot
         theta_f = warp_angle(theta_obs + theta_robot)
+        line_segment_world = self.TransformLineSegmentToWorldFrame(line_segment, xk)
 
         J1 = np.array([
             [cos(theta_obs + theta_robot), sin(theta_obs + theta_robot), -sin(theta_obs + theta_robot) * x_robot + cos(theta_obs + theta_robot) * y_robot],
@@ -175,8 +210,9 @@ class DataAssociation:
         cov_feature_map = J1 @ Pk @ J1.T + J2 @ Rfi @ J2.T
         self.map_feature.append([range_f, theta_f])
         self.map_feature_cov.append(cov_feature_map)
+        self.map_line_segments.append(line_segment_world)
     
-    def AddmultipleNewFeatures(self, xk, Pk, zf, Rf):
+    def AddmultipleNewFeatures(self, xk, Pk, zf, Rf, new_line_segments):
         """
         Adds multiple new features to the map given a set of feature observations :math:`z_f` and their covariance matrices :math:`R_f`. The new features are added to the map if they have not been associated with any expected feature observation :math:`h_{f_j}`.
 
@@ -184,29 +220,32 @@ class DataAssociation:
         :param Pk: covariance matrix of the state vector
         :param zf: vector of feature observations unassociated with any expected feature observation
         :param Rf: Covariance matrix of the feature observations unassociated with any expected feature observation
-        :param H: vector of association hypothesis
+        :param new_line_segments: vector of line segments corresponding to the new features
         """
         
         for i in range(len(zf)):
-            self.AddNewFeature(xk, Pk, zf[i], Rf[i])
+            self.AddNewFeature(xk, Pk, zf[i], Rf[i], new_line_segments[i])
         
-        return self.map_feature, self.map_feature_cov
+        return self.map_feature, self.map_feature_cov, self.map_line_segments
 
-    def GetUnassociatedFeatures(self, zf, Rf, H):
+    def GetUnassociatedFeatures(self, line_segments, zf, Rf, H):
         """
         Returns the vector of feature observations :math:`z_f` that have not been associated with any expected feature observation :math:`h_{f_j}` given the vector of association hypothesis :math:`H`.
 
+        :param line_segments: vector of line segments extracted from the LiDAR scan
         :param zf: vector of feature observations
         :param Rf: Covariance matrix of the feature observations
         :param H: vector of association hypothesis
-        :return: vector of feature observations unassociated with any expected feature observation and their covariance matrices
+        :return: vector of feature observations unassociated with any expected feature observation, their covariance matrices, and the corresponding line segments
         """
 
         unassociated_features = []
         unassociated_features_cov = []
+        unassociated_line_segments = []
         for i in range(len(zf)):
             if H[i] is None:
                 unassociated_features.append(zf[i])
                 unassociated_features_cov.append(Rf[i])
+                unassociated_line_segments.append(line_segments[i])
 
-        return unassociated_features, unassociated_features_cov
+        return unassociated_features, unassociated_features_cov, unassociated_line_segments
