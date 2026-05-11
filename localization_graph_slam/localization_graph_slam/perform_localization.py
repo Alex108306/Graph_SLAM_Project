@@ -3,10 +3,9 @@ from rclpy.node import Node
 
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import JointState, Imu, LaserScan
-from geometry_msgs.msg import PoseStamped, Twist, TransformStamped, Point
-from std_msgs.msg import Float64MultiArray
+from geometry_msgs.msg import PoseStamped, Twist, TransformStamped
 from tf2_ros import TransformBroadcaster
-from visualization_msgs.msg import MarkerArray, Marker
+from visualization_msgs.msg import MarkerArray
 
 import gtsam
 from gtsam.symbol_shorthand import L, X
@@ -54,12 +53,6 @@ class GraphSlam(Node):
         self.odom_ground_truth = self.create_subscription(Odometry, "/turtlebot/odom_ground_truth", self.recieve_odom_ground_truth, 20)
         self.odom_pub = self.create_publisher(Odometry, "/turtlebot/odom", 20)
         self.odom_ground_truth_enu_pub = self.create_publisher(Odometry, "/turtlebot/odom_ground_truth_enu", 20)
-        self.visualize_map_pub = self.create_publisher(MarkerArray, "/turtlebot/line_features", 20)
-        self.arm_controller_pub = self.create_publisher(
-            Float64MultiArray,
-            '/turtlebot/swiftpro/joint_velocity_controller/command',
-            10,
-        )
         self.tf_br = TransformBroadcaster(self)
 
         # Initialize the clock and the last time variable
@@ -122,7 +115,6 @@ class GraphSlam(Node):
         orientation_ned = np.array([msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w])
         orientation_enu = quaternion_ned_to_enu(orientation_ned)
         cov_orientation = msg.orientation_covariance
-        # self.get_logger().info(f"Received IMU orientation: {orientation_enu}, covariance: {cov_orientation[8]}")  # Log the yaw covariance
 
         # Convert quaternion to Euler angles and extract yaw (theta)
         self.imu_orientation = euler_from_quaternion(orientation_enu[0], orientation_enu[1], orientation_enu[2], orientation_enu[3])[2]  # Adjust for initial orientation
@@ -132,7 +124,7 @@ class GraphSlam(Node):
         # Store IMU data in buffer
         self.imu_buffer.append([self.imu_orientation, self.imu_covariance])
         self.imu_time_buffer.append(self.get_clock().now().nanoseconds / 1e9)
-        if len(self.imu_buffer) > 5:  # Limit buffer size
+        if len(self.imu_buffer) > 20:  # Limit buffer size
             self.imu_buffer.pop(0)
             self.imu_time_buffer.pop(0)
 
@@ -169,13 +161,9 @@ class GraphSlam(Node):
 
         self.line_buffer.append([polar_coordinates, polar_covariances, line_segments])
         self.line_time_buffer.append(self.get_clock().now().nanoseconds / 1e9)
-        if len(self.line_buffer) > 5:  # Limit buffer size
+        if len(self.line_buffer) > 20:  # Limit buffer size
             self.line_buffer.pop(0)
             self.line_time_buffer.pop(0)
-
-        # Debug log
-        # for i, polar_coordinate in enumerate(polar_coordinates):
-        #     self.get_logger().info(f"Received line feature {i}: range {polar_coordinate[0]}, angle {polar_coordinate[1]}")
     
     # Define motion model
     def f(self, wheel_velocity, dt):
@@ -346,7 +334,6 @@ class GraphSlam(Node):
 
     # Update function
     def Update(self, xk_bar, Pk_bar):
-        # self.get_logger().info(f"Updating graph with IMU update: {self.imu_update_flag}, LiDAR update: {self.lidar_update_flag}")  # Log the update flags
 
         # Get matrix and value for updating process
         Hk = self.Hk()
@@ -358,7 +345,9 @@ class GraphSlam(Node):
         # Add pose factor to the graph
         self.i += 1
         rel_pos = gtsam.Pose2(self.rel_disp[0,0], self.rel_disp[1,0], self.rel_disp[2,0])
-        OdometryNoise = gtsam.noiseModel.Gaussian.Covariance(self.rel_cov + 1e-7 * np.identity(3))  # Adding a small value to prevent zero covariance
+        # Regularize covariance so BetweenFactor stays well-posed even when motion is near-zero.
+        rel_cov_regularized = self.rel_cov + np.eye(3) * 1e-7
+        OdometryNoise = gtsam.noiseModel.Gaussian.Covariance(rel_cov_regularized)
         sigma_heading = float(np.sqrt(Rk[0,0] + 1e-7))  # Adding a small value to prevent zero covariance
         pose_key_prev = gtsam.symbol('X', self.i-1)
         pose_key_curr = gtsam.symbol('X', self.i)
@@ -366,8 +355,14 @@ class GraphSlam(Node):
 
 
         if self.imu_update_flag:
-            # self.get_logger().info(f"Adding IMU factor with orientation: {zk[0,0]}, covariance: {Rk[0,0]}")  # Log the IMU measurement and covariance
-            self.graph.add(gtsam.PoseRotationPrior2D(pose_key_curr, gtsam.Rot2(zk[0,0]), gtsam.noiseModel.Isotropic.Sigma(1, sigma_heading)))
+            # Jazzy/GTSAM binding expects a Pose2 measurement for PoseRotationPrior2D.
+            self.graph.add(
+                gtsam.PoseRotationPrior2D(
+                    pose_key_curr,
+                    gtsam.Pose2(0.0, 0.0, zk[0, 0]),
+                    gtsam.noiseModel.Isotropic.Sigma(1, sigma_heading),
+                )
+            )
             self.k += 1
         
         self.initial.insert(pose_key_curr, gtsam.Pose2(xk_bar[0,0], xk_bar[1,0], xk_bar[2,0]))
@@ -376,14 +371,9 @@ class GraphSlam(Node):
             # self.get_logger().info(f"Number of line features observed: {len(self.polar_coordinates)}")
             for j in range(len(self.H)):
                 if self.H[j] != None:
-                    measurement = np.array([self.polar_coordinates[j][0], self.polar_coordinates[j][1]])
                     noise_model = gtsam.noiseModel.Gaussian.Covariance(self.polar_covariances[j])
                     feature_key = gtsam.symbol('L', self.H[j])
-                    keys = gtsam.KeyVector()
-                    keys.append(pose_key_curr)
-                    keys.append(feature_key)
-                    m = measurement.copy()
-                    self.graph.add(gtsam.CustomFactor(noise_model, keys, lambda this, values, jacobians, meas=m: self.LineFeatureError(meas, this, values, jacobians)))
+                    self.graph.add(gtsam.BearingRangeFactor2D(pose_key_curr, feature_key, gtsam.Rot2(self.polar_coordinates[j][1]), self.polar_coordinates[j][0], noise_model))
             if len(self.H) > 0 and self.imu_update_flag == False:
                 self.k += 1
 
@@ -419,8 +409,10 @@ class GraphSlam(Node):
             Pk = Pk_full[0:3, 0:3]
             for j in range(len(self.line_feature_map)):
                 feature_key = gtsam.symbol('L', j)
-                line_feature = results.atPoint2(feature_key)
-                self.line_feature_map[j] = [line_feature[0], line_feature[1]]
+                catersian_feature = results.atPoint2(feature_key)
+                polar_feature = CartesianToPolar([catersian_feature[0], catersian_feature[1]])
+                self.get_logger().info(f"Feature {j}: Cartesian coordinates: ({catersian_feature[0]}, {catersian_feature[1]}), Polar coordinates: ({polar_feature[0]}, {polar_feature[1]})")
+                self.line_feature_map[j] = polar_feature
                 self.line_feature_cov_map[j] = Pk_full[3+2*j:3+2*j+2, 3+2*j:3+2*j+2]
         else:
             xk = xk_bar
@@ -433,9 +425,6 @@ class GraphSlam(Node):
 
     
     def joint_state_callback(self, msg):
-        arm_control = Float64MultiArray()
-        arm_control.data = [0.0, 0.0, -1.0, 0.0]
-        self.arm_controller_pub.publish(arm_control)
         if not self.intialize_theta:
             return
         current_time = self.get_clock().now()
@@ -451,7 +440,6 @@ class GraphSlam(Node):
             return
 
         dt = (current_time - self.last_time).nanoseconds / 1e9
-        # self.get_logger().info(f"Time difference between joint state messages: {dt} seconds")  # Log the time difference between messages
         self.last_time = current_time
         if dt <=0:
             return
@@ -496,7 +484,6 @@ class GraphSlam(Node):
         if self.lidar_update_flag:
             self.data_association = DataAssociation(self.confidence_level, self.line_feature_map, self.line_feature_cov_map, self.line_segments_map)
             self.H = self.data_association.DataAssociation(xk_bar, Pk_bar, self.polar_coordinates, self.polar_covariances)
-        
         self.get_logger().info(f"Associated Feature: {self.H}")  # Log the number of associated features
         
         # Check if robot moving or is translating larger than some threshold to update the graph
@@ -504,10 +491,8 @@ class GraphSlam(Node):
         rot_delta = abs(self.rel_disp[2, 0])
         should_add_key_frame = (trans_delta > 0.01) or (rot_delta > 0.01) or self.time_accumulate > 0.5
 
-        # robot_moving = (abs(wheel_velocity[0, 0]) > 0.01) or (abs(wheel_velocity[1, 0]) > 0.01)
-        # should_add_key_frame = should_add_key_frame and (not robot_moving)
-        # Update function 
-        if should_add_key_frame and (self.imu_update_flag == True or self.lidar_update_flag == True):
+        # Update function so use predict
+        if self.imu_update_flag == True or self.lidar_update_flag == True:
             xk, Pk = self.Update(xk_bar, Pk_bar)
             self.x = xk[0, 0]
             self.y = xk[1, 0]
@@ -535,9 +520,6 @@ class GraphSlam(Node):
                 pose_key_curr = gtsam.symbol('X', self.i)
                 self.AddNewFeature(pose_key_curr, unsociated_features, unsociated_features_cov)
             self.lidar_update_flag = False
-        
-        # for i, line in enumerate(self.line_feature_map):
-        #     self.get_logger().info(f"Line feature {i} in the map: rho {line[0]}, alpha {line[1]}")
 
         # self.get_logger().info(f"Number of features in the map: {len(self.line_feature_map)}")
         self.visualize_map()
@@ -594,9 +576,8 @@ class GraphSlam(Node):
 
     def recieve_odom_ground_truth(self, msg):
         odom_ground_truth = msg
-        x = odom_ground_truth.pose.pose.position.x - 2.150009315590629
-        y = odom_ground_truth.pose.pose.position.y - 1.3995580194955188
-        # self.get_logger().info(f"Received ground truth odometry: x {x}, y {y}")  # Log the received ground truth position
+        x = odom_ground_truth.pose.pose.position.x
+        y = odom_ground_truth.pose.pose.position.y
         linear_velocity = odom_ground_truth.twist.twist.linear.x
         angular_velocity = odom_ground_truth.twist.twist.angular.z
 

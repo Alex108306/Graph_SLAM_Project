@@ -5,7 +5,6 @@ from launch.substitutions import LaunchConfiguration, Command, PathJoinSubstitut
 from launch_ros.actions import Node, PushRosNamespace
 from launch_ros.substitutions import FindPackageShare
 import gtsam
-
 def generate_launch_description():
     # 1. Locate packages
     pkg_turtlebot_sim = FindPackageShare('turtlebot_simulation')
