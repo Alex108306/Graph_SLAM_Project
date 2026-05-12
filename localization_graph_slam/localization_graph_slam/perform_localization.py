@@ -14,6 +14,7 @@ from gtsam.symbol_shorthand import L, X
 
 import numpy as np
 from math import atan2, sin, cos
+import math
 
 from .utils import quaternion_from_euler, euler_from_quaternion, quaternion_ned_to_enu, warp_angle
 from .line_extraction import SplitAndMerge
@@ -31,9 +32,31 @@ class GraphSlam(Node):
     def __init__(self):
         super().__init__('graph_slam')
 
+        self.declare_parameter('mode', 'sim')
+        self.mode = self.get_parameter('mode').get_parameter_value().string_value.lower()
+        if self.mode not in ['sim', 'real']:
+            self.get_logger().warn(f"Unknown mode '{self.mode}', fallback to 'sim'.")
+            self.mode = 'sim'
+        self._real_joint_state_warned = False
+
         # Initialize frame
-        self.world_frame = "world_enu"
-        self.base_footprint_frame = "turtlebot/base_footprint"
+        if self.mode == 'sim':
+            self.world_frame = "world_enu"
+            self.base_footprint_frame = "turtlebot/base_footprint"
+            imu_topic = "/turtlebot/sensors/imu_data"
+            odom_ground_truth_topic = "/turtlebot/odom_ground_truth"
+            self.publish_ground_truth_enu = True
+            self.odom_topic = "/turtlebot/odom"
+            self.publish_tf = True
+        else:
+            self.world_frame = "odom"
+            self.base_footprint_frame = "base_footprint"
+            imu_topic = "/turtlebot/imu"
+            odom_ground_truth_topic = None
+            self.publish_ground_truth_enu = False
+            # On real robot, keep robot stack as TF authority and publish SLAM odometry on separate topic.
+            self.odom_topic = "/turtlebot/odom_graph_slam"
+            self.publish_tf = False
 
         # Initialize parameters of the robot
         self.base_length = 0.23
@@ -49,18 +72,29 @@ class GraphSlam(Node):
 
         # Defining node publisher and subcriber
         self.joint_states_sub = self.create_subscription(JointState, "/turtlebot/joint_states", self.joint_state_callback, 20)
-        self.imu_sub = self.create_subscription(Imu, "/turtlebot/sensors/imu_data", self.recieve_imu, 20)
+        self.imu_sub = self.create_subscription(Imu, imu_topic, self.recieve_imu, 20)
         self.lidar_sub = self.create_subscription(LaserScan, "/turtlebot/scan", self.receive_lidar, 20)
-        self.odom_ground_truth = self.create_subscription(Odometry, "/turtlebot/odom_ground_truth", self.recieve_odom_ground_truth, 20)
-        self.odom_pub = self.create_publisher(Odometry, "/turtlebot/odom", 20)
-        self.odom_ground_truth_enu_pub = self.create_publisher(Odometry, "/turtlebot/odom_ground_truth_enu", 20)
+        self.odom_pub = self.create_publisher(Odometry, self.odom_topic, 20)
+        if self.publish_ground_truth_enu:
+            self.odom_ground_truth = self.create_subscription(Odometry, odom_ground_truth_topic, self.recieve_odom_ground_truth, 20)
+            self.odom_ground_truth_enu_pub = self.create_publisher(Odometry, "/turtlebot/odom_ground_truth_enu", 20)
+        else:
+            self.odom_ground_truth = None
+            self.odom_ground_truth_enu_pub = None
         self.visualize_map_pub = self.create_publisher(MarkerArray, "/turtlebot/line_features", 20)
-        self.arm_controller_pub = self.create_publisher(
-            Float64MultiArray,
-            '/turtlebot/swiftpro/joint_velocity_controller/command',
-            10,
-        )
-        self.tf_br = TransformBroadcaster(self)
+        self.line_error_pub_ = self.create_publisher(MarkerArray, "/turtlebot/line_feature_errors", 20)
+        if self.mode == 'sim':
+            self.arm_controller_pub = self.create_publisher(
+                Float64MultiArray,
+                '/turtlebot/swiftpro/joint_velocity_controller/command',
+                10,
+            )
+        else:
+            self.arm_controller_pub = None
+        if self.publish_tf:
+            self.tf_br = TransformBroadcaster(self)
+        else:
+            self.tf_br = None
 
         # Initialize the clock and the last time variable
         self.first_time = True
@@ -98,7 +132,10 @@ class GraphSlam(Node):
         self.k = 0
 
         # Initialize line extraction
-        self.line_extractor = SplitAndMerge(0.01)
+        if self.mode == 'sim':
+            self.line_extractor = SplitAndMerge(0.01, True, True)
+        else:
+            self.line_extractor = SplitAndMerge(0.01, False, False)
         self.polar_coordinates = []
         self.polar_covariances = []
 
@@ -119,13 +156,16 @@ class GraphSlam(Node):
     # Function receive imu infomation data
     def recieve_imu(self, msg):
         # Extract orientation and covariance from IMU message
-        orientation_ned = np.array([msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w])
-        orientation_enu = quaternion_ned_to_enu(orientation_ned)
+        orientation_raw = np.array([msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w])
+        if self.mode == 'sim':
+            orientation_used = quaternion_ned_to_enu(orientation_raw)
+        else:
+            orientation_used = orientation_raw
         cov_orientation = msg.orientation_covariance
-        # self.get_logger().info(f"Received IMU orientation: {orientation_enu}, covariance: {cov_orientation[8]}")  # Log the yaw covariance
+        # self.get_logger().info(f"Received IMU orientation: {orientation_used}, covariance: {cov_orientation[8]}")  # Log the yaw covariance
 
         # Convert quaternion to Euler angles and extract yaw (theta)
-        self.imu_orientation = euler_from_quaternion(orientation_enu[0], orientation_enu[1], orientation_enu[2], orientation_enu[3])[2]  # Adjust for initial orientation
+        self.imu_orientation = euler_from_quaternion(orientation_used[0], orientation_used[1], orientation_used[2], orientation_used[3])[2]  # Adjust for initial orientation
         self.imu_covariance = np.array([[cov_orientation[8]]])  # Assuming covariance for yaw is at index 8
         self.imu_update_flag = True
 
@@ -433,9 +473,10 @@ class GraphSlam(Node):
 
     
     def joint_state_callback(self, msg):
-        arm_control = Float64MultiArray()
-        arm_control.data = [0.0, 0.0, -1.0, 0.0]
-        self.arm_controller_pub.publish(arm_control)
+        if self.arm_controller_pub is not None:
+            arm_control = Float64MultiArray()
+            arm_control.data = [0.0, 0.0, -1.0, 0.0]
+            self.arm_controller_pub.publish(arm_control)
         if not self.intialize_theta:
             return
         current_time = self.get_clock().now()
@@ -458,8 +499,24 @@ class GraphSlam(Node):
         
         self.time_accumulate += dt
         
-        left_wheel_velocity = msg.velocity[0]
-        right_wheel_velocity = msg.velocity[1]
+        if self.mode == 'real':
+            if len(msg.name) != len(msg.velocity):
+                if not self._real_joint_state_warned:
+                    self.get_logger().warn("Skipping real joint_state message with mismatched name/velocity lengths.")
+                    self._real_joint_state_warned = True
+                return
+            if "wheel_left_joint" not in msg.name or "wheel_right_joint" not in msg.name:
+                if not self._real_joint_state_warned:
+                    self.get_logger().warn("Skipping real joint_state message without wheel_left_joint/wheel_right_joint.")
+                    self._real_joint_state_warned = True
+                return
+            left_idx = msg.name.index("wheel_left_joint")
+            right_idx = msg.name.index("wheel_right_joint")
+            left_wheel_velocity = msg.velocity[left_idx]
+            right_wheel_velocity = msg.velocity[right_idx]
+        else:
+            left_wheel_velocity = msg.velocity[0]
+            right_wheel_velocity = msg.velocity[1]
 
         # Adding noise to the wheel encoder sensor
         wheel_velocity = np.array([[left_wheel_velocity], [right_wheel_velocity]]) # + np.random.normal(np.zeros((2,1)), np.array([np.sqrt(self.covariance_wheel_encoder.diagonal())]).T)
@@ -467,7 +524,7 @@ class GraphSlam(Node):
         current_time_in_sec = current_time.nanoseconds / 1e9
         # Try to synchronize the latest IMU and LiDAR data with the current joint state data
         if self.imu_update_flag and len(self.imu_time_buffer) > 0:
-            while len(self.imu_time_buffer) > 0 and abs(self.imu_time_buffer[0] - current_time_in_sec) > 0.001:
+            while len(self.imu_time_buffer) > 0 and abs(self.imu_time_buffer[0] - current_time_in_sec) > 0.01:
                 self.imu_time_buffer.pop(0)
                 self.imu_buffer.pop(0)
             if len(self.imu_buffer) > 0:
@@ -478,7 +535,7 @@ class GraphSlam(Node):
                 self.imu_update_flag = False
         
         if self.lidar_update_flag and len(self.line_time_buffer) > 0:
-            while len(self.line_time_buffer) > 0 and abs(self.line_time_buffer[0] - current_time_in_sec) > 0.001:
+            while len(self.line_time_buffer) > 0 and abs(self.line_time_buffer[0] - current_time_in_sec) > 0.01:
                 self.line_time_buffer.pop(0)
                 self.line_buffer.pop(0)
             if len(self.line_buffer) > 0:
@@ -541,6 +598,7 @@ class GraphSlam(Node):
 
         # self.get_logger().info(f"Number of features in the map: {len(self.line_feature_map)}")
         self.visualize_map()
+        self.visualize_boundary_error_lines_map()
         # Transfer from velocity wheel to robot velocity
         linear_velocity = 1/2 * self.radius_wheel * (wheel_velocity[0, 0] + wheel_velocity[1, 0])
         angular_velocity = (self.radius_wheel/self.base_length) * (-wheel_velocity[0, 0] + wheel_velocity[1, 0])
@@ -578,21 +636,25 @@ class GraphSlam(Node):
 
         self.odom_pub.publish(odom_msg)
 
-        # Broadcast TF
-        t = TransformStamped()
-        t.header.stamp = current_time.to_msg()
-        t.header.frame_id = self.world_frame
-        t.child_frame_id = self.base_footprint_frame
-        t.transform.translation.x = self.x
-        t.transform.translation.y = self.y
-        t.transform.translation.z = 0.0
-        t.transform.rotation.x = q[0]
-        t.transform.rotation.y = q[1]
-        t.transform.rotation.z = q[2]
-        t.transform.rotation.w = q[3]
-        self.tf_br.sendTransform(t)
+        # Broadcast TF only in sim mode to avoid conflicts with robot stack TF on real robot.
+        if self.publish_tf:
+            t = TransformStamped()
+            t.header.stamp = current_time.to_msg()
+            t.header.frame_id = self.world_frame
+            t.child_frame_id = self.base_footprint_frame
+            t.transform.translation.x = self.x
+            t.transform.translation.y = self.y
+            t.transform.translation.z = 0.0
+            t.transform.rotation.x = q[0]
+            t.transform.rotation.y = q[1]
+            t.transform.rotation.z = q[2]
+            t.transform.rotation.w = q[3]
+            self.tf_br.sendTransform(t)
 
     def recieve_odom_ground_truth(self, msg):
+        if not self.publish_ground_truth_enu:
+            return
+
         odom_ground_truth = msg
         x = odom_ground_truth.pose.pose.position.x - 2.150009315590629
         y = odom_ground_truth.pose.pose.position.y - 1.3995580194955188
@@ -666,6 +728,84 @@ class GraphSlam(Node):
             marker_array.markers.append(marker)
 
         self.visualize_map_pub.publish(marker_array)
+    
+    def _regularize_covariance(self, cov: np.ndarray, eps: float = 1e-9) -> np.ndarray:
+        cov_sym = 0.5 * (cov + cov.T)
+        return cov_sym + np.eye(2) * eps
+    
+    def _curve_boundary_points(self, line: list, cov_line: np.ndarray, num_samples: int = 100) -> tuple:
+        start_point = np.array(line[0], dtype=float)
+        end_point = np.array(line[1], dtype=float)
+        line_vec = end_point - start_point
+        line_len = np.linalg.norm(line_vec)
+        if line_len <= 1e-9:
+            return [], []
+        samples_per_meter = 80.0
+        min_samples = 40
+        max_samples = 400
+        num_samples = int(np.clip(math.ceil(samples_per_meter * line_len), min_samples, max_samples))
+
+        tangent = line_vec / line_len
+        # Match the line normal convention used by fit_line / atan2(b, a).
+        normal = np.array([tangent[1], -tangent[0]])
+        theta = math.atan2(normal[1], normal[0])
+
+        cov_reg = self._regularize_covariance(cov_line)
+        samples_s = np.linspace(0.0, line_len, num_samples)
+        boundary_plus = []
+        boundary_minus = []
+        for s in samples_s:
+            point_nominal = start_point + s * tangent
+            jacobian = np.array([1.0, point_nominal[0] * math.sin(theta) - point_nominal[1] * math.cos(theta)])
+            variance_dist = float(jacobian @ cov_reg @ jacobian.T)
+            variance_dist = max(variance_dist, 0.0)
+            confidence_dist = math.sqrt(5.991464547107979 * variance_dist)
+            boundary_plus.append(point_nominal + confidence_dist * normal)
+            boundary_minus.append(point_nominal - confidence_dist * normal)
+
+        return boundary_plus, boundary_minus
+    
+    def visualize_boundary_error_lines_map(self):
+        """
+        Visualize line segments in RVIZ2 using MarkerArray
+        """
+
+        lines_error_visualization = MarkerArray()
+        for i, line in enumerate(self.line_segments_map):
+            start_point, end_point = line[0], line[1]
+            cov_line = self.line_feature_cov_map[i]
+            boundary_plus, boundary_minus = self._curve_boundary_points([start_point, end_point], cov_line)
+            if len(boundary_plus) > 1 and len(boundary_minus) > 1:
+                marker = Marker()
+                marker.header.frame_id = self.world_frame
+                marker.header.stamp = self.get_clock().now().to_msg()
+                marker.ns = "line_uncertainty_curve"
+                marker.id = 3000 * i
+                marker.type = Marker.LINE_STRIP
+                marker.action = Marker.ADD
+                marker.scale.x = 0.02
+                marker.color.a = 0.85
+                marker.color.r = 1.0
+                marker.color.g = 0.85
+                marker.color.b = 0.0
+                marker.points = [Point(x=float(p[0]), y=float(p[1]), z=0.0) for p in boundary_plus]
+                lines_error_visualization.markers.append(marker)
+                marker = Marker()
+                marker.header.frame_id = self.world_frame
+                marker.header.stamp = self.get_clock().now().to_msg()
+                marker.ns = "line_uncertainty_curve"
+                marker.id = 3000 * i + 1
+                marker.type = Marker.LINE_STRIP
+                marker.action = Marker.ADD
+                marker.scale.x = 0.02
+                marker.color.a = 0.85
+                marker.color.r = 1.0
+                marker.color.g = 0.85
+                marker.color.b = 0.0
+                marker.points = [Point(x=float(p[0]), y=float(p[1]), z=0.0) for p in boundary_minus]
+                lines_error_visualization.markers.append(marker)
+        
+        self.line_error_pub_.publish(lines_error_visualization)
 
 
 def main(args=None):

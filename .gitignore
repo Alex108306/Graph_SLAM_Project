@@ -1,3 +1,7 @@
 build/
 install/
 log/
+
+localization_graph_slam/realrobotinfos.txt
+localization_graph_slam_mine.zip
+localization_graph_slam/__pycache__/

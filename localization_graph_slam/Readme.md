@@ -43,40 +43,52 @@ ros2 launch turtlebot_simulation turtlebot_hoi_circuit1.launch.py
 Run extraction line node:
 
 ```bash
-ros2 run localization_graph_slam line_extraction
+ros2 run localization_graph_slam line_extraction --ros-args -p mode:=sim
+```
+
+### Step 3: Run Graph SLAM node
+
+```bash
+ros2 run localization_graph_slam localization_graph_slam --ros-args -p mode:=sim
+```
+
+## Run Modes
+
+Both nodes support a `mode` parameter:
+
+- `sim`: keeps simulation conventions (IMU NED->ENU conversion, LiDAR +pi flip, simulation frames/topics).
+- `real`: uses real robot conventions (no IMU NED->ENU conversion, LiDAR without +pi flip, real robot frames/topics).
+
+### Simulation mode
+
+```bash
+ros2 run localization_graph_slam line_extraction --ros-args -p mode:=sim
+ros2 run localization_graph_slam localization_graph_slam --ros-args -p mode:=sim
+```
+
+### Real robot mode
+
+```bash
+ros2 run localization_graph_slam line_extraction --ros-args -p mode:=real
+ros2 run localization_graph_slam localization_graph_slam --ros-args -p mode:=real
 ```
 
 
-cd /home/elchina/Documents/HOL_project/Graph_SLAM_Project_tomerge
-source /home/elchina/Documents/HOL_project/.venv-gtsam43/bin/activate
-source /opt/ros/jazzy/setup.bash
-source install/setup.bash
-ros2 launch turtlebot_simulation turtlebot_hoi_circuit1.launch.py
-
-cd /home/elchina/Documents/HOL_project/Graph_SLAM_Project_tomerge
-source /home/elchina/Documents/HOL_project/.venv-gtsam43/bin/activate
-source /opt/ros/jazzy/setup.bash
-source install/setup.bash
-python -m localization_graph_slam.line_extraction
-
-cd /home/elchina/Documents/HOL_project/Graph_SLAM_Project_tomerge
-source /home/elchina/Documents/HOL_project/.venv-gtsam43/bin/activate
-source /opt/ros/jazzy/setup.bash
-source install/setup.bash
-python -m localization_graph_slam.perform_localization
-
-cd /home/elchina/Documents/HOL_project/Graph_SLAM_Project_tomerge
-source /home/elchina/Documents/HOL_project/.venv-gtsam43/bin/activate
-source /opt/ros/jazzy/setup.bash
-source install/setup.bash
-ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -r __ns:=/turtlebot
 
 
 
 
 
 
----------------------------------------
+
+
+
+
+
+
+-----------------
+
+
 
 cd /home/elchina/Documents/HOL_project/Graph_SLAM_Project_tomerge
 source /home/elchina/Documents/HOL_project/.venv-gtsam43/bin/activate
@@ -84,16 +96,52 @@ source /opt/ros/jazzy/setup.bash
 source install/setup.bash
 ros2 launch turtlebot_simulation turtlebot_hoi_circuit1.launch.py
 
+<!-- cd /home/elchina/Documents/HOL_project/Graph_SLAM_Project_tomerge
+source /home/elchina/Documents/HOL_project/.venv-gtsam43/bin/activate
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+python -m localization_graph_slam.line_extraction --ros-args -p mode:=sim -->
 
 cd /home/elchina/Documents/HOL_project/Graph_SLAM_Project_tomerge
 source /home/elchina/Documents/HOL_project/.venv-gtsam43/bin/activate
 source /opt/ros/jazzy/setup.bash
 source install/setup.bash
-python -m localization_graph_slam.line_extraction
-
+python -m localization_graph_slam.perform_localization --ros-args -p mode:=sim
 
 cd /home/elchina/Documents/HOL_project/Graph_SLAM_Project_tomerge
 source /home/elchina/Documents/HOL_project/.venv-gtsam43/bin/activate
 source /opt/ros/jazzy/setup.bash
 source install/setup.bash
-python -m localization_graph_slam.perform_localization
+ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -r /cmd_vel:=/turtlebot/cmd_vel
+
+
+-----------------
+
+Real robot run (same style as above):
+
+cd /home/elchina/Documents/HOL_project/Graph_SLAM_Project_tomerge
+source /home/elchina/Documents/HOL_project/.venv-gtsam43/bin/activate
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+python -m localization_graph_slam.line_extraction --ros-args -p mode:=real
+
+cd /home/elchina/Documents/HOL_project/Graph_SLAM_Project_tomerge
+source /home/elchina/Documents/HOL_project/.venv-gtsam43/bin/activate
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+python -m localization_graph_slam.perform_localization --ros-args -p mode:=real
+
+cd /home/elchina/Documents/HOL_project/Graph_SLAM_Project_tomerge
+source /home/elchina/Documents/HOL_project/.venv-gtsam43/bin/activate
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -r /cmd_vel:=/turtlebot/cmd_vel
+
+
+
+cd /home/elchina/Documents/HOL_project/Graph_SLAM_Project_tomerge
+source /home/elchina/Documents/HOL_project/.venv-gtsam43/bin/activate
+source /opt/ros/jazzy/setup.bash
+colcon build --packages-select localization_graph_slam
+source install/setup.bash
+python -m localization_graph_slam.perform_localization --ros-args -p mode:=real
