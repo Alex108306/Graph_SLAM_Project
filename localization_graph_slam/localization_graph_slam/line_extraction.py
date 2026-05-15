@@ -17,7 +17,7 @@ class SplitAndMerge:
         self.lidar_flip_pi = lidar_flip_pi
         self.decrement_angle = decrement_angle
     
-    def transform_lidar_to_cartesian(self, lidar_msg):
+    def transform_lidar_to_cartesian(self, lidar_msg, v: float = 0.0, omega: float = 0.0):
         """
         Transform lidar from Polar cooridnates to Catersian coordinates
 
@@ -35,6 +35,13 @@ class SplitAndMerge:
         else:
             angle_min = lidar_msg.angle_min
         current_angle = angle_min
+
+        # Use per-beam acquisition timing to de-distort scans while robot is moving.
+        time_inc = lidar_msg.time_increment
+        if time_inc <= 0.0 and lidar_msg.scan_time > 0.0 and len(lidar_range) > 0:
+            time_inc = lidar_msg.scan_time / len(lidar_range)
+        apply_distortion = time_inc > 0.0 and (abs(omega) > 1e-6 or abs(v) > 1e-6)
+
         for i in range(len(lidar_range)):
             if math.isinf(lidar_range[i]):
                 if self.decrement_angle:
@@ -42,12 +49,30 @@ class SplitAndMerge:
                 else:
                     current_angle += angle_increment
                 continue
-            x_point = np.cos(current_angle) * lidar_range[i]
-            y_point = np.sin(current_angle) * lidar_range[i]
+            x_raw = np.cos(current_angle) * lidar_range[i]
+            y_raw = np.sin(current_angle) * lidar_range[i]
             if self.decrement_angle:
                 current_angle -= angle_increment
             else:
                 current_angle += angle_increment
+
+            if apply_distortion:
+                t_i = i * time_inc
+                dtheta_i = omega * t_i
+                if abs(omega) > 1e-5:
+                    dx_w = (v / omega) * math.sin(dtheta_i)
+                    dy_w = (v / omega) * (1.0 - math.cos(dtheta_i))
+                else:
+                    dx_w = v * t_i
+                    dy_w = 0.0
+                c = math.cos(dtheta_i)
+                s = math.sin(dtheta_i)
+                x_point = c * x_raw - s * y_raw + dx_w
+                y_point = s * x_raw + c * y_raw + dy_w
+            else:
+                x_point = x_raw
+                y_point = y_raw
+
             lidar_points.append(np.array([x_point, y_point]))
         
         return lidar_points
@@ -215,7 +240,7 @@ class SplitAndMerge:
         Return:
             Covariance matrix of the line segment with respect to the robot local frame
         """
-        sigma_r = 0.07 # 30 cm
+        sigma_r = 0.2 # 30 cm
         cov_max_2D_point = np.array([[sigma_r**2, 0.0], [0.0, sigma_r**2]])
 
         line_params = self.fit_line(line[0], line[1])

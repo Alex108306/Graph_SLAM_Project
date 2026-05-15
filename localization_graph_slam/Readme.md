@@ -145,3 +145,16 @@ source /opt/ros/jazzy/setup.bash
 colcon build --packages-select localization_graph_slam
 source install/setup.bash
 python -m localization_graph_slam.perform_localization --ros-args -p mode:=real
+
+ros2 service call /turtlebot/turtlebot_shutdown std_srvs/srv/Trigger "{}"
+
+ros2 topic pub /turtlebot/commands/reset_odometry std_msgs/msg/Empty "{}"
+
+cd /home/elchina/Documents/HOL_project/Graph_SLAM_Project_tomerge
+source /home/elchina/Documents/HOL_project/.venv-gtsam43/bin/activate
+source /opt/ros/jazzy/setup.bash
+colcon build --packages-select localization_graph_slam
+source install/setup.bash
+python -m localization_graph_slam.perform_localization --ros-args -p mode:=real -p use_sim_time:=true
+
+ros2 bag play /home/elchina/Documents/HOL_project/Graph_SLAM_Project_tomerge/localization_graph_slam/localization_debug --clock 50 -r 1.0

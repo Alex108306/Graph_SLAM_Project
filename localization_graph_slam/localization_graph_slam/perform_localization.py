@@ -1,11 +1,12 @@
 import rclpy
 from rclpy.node import Node
+from rclpy.time import Time
 
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import JointState, Imu, LaserScan
 from geometry_msgs.msg import PoseStamped, Twist, TransformStamped, Point
 from std_msgs.msg import Float64MultiArray
-from tf2_ros import TransformBroadcaster
+from tf2_ros import TransformBroadcaster, Buffer, TransformListener, TransformException
 from visualization_msgs.msg import MarkerArray, Marker
 
 import gtsam
@@ -38,6 +39,8 @@ class GraphSlam(Node):
             self.get_logger().warn(f"Unknown mode '{self.mode}', fallback to 'sim'.")
             self.mode = 'sim'
         self._real_joint_state_warned = False
+        self._real_tf_warned = False
+        self._real_odom_init_warned = False
 
         # Initialize frame
         if self.mode == 'sim':
@@ -48,6 +51,9 @@ class GraphSlam(Node):
             self.publish_ground_truth_enu = True
             self.odom_topic = "/turtlebot/odom"
             self.publish_tf = True
+            self.real_imu_heading_sigma = None
+            self.real_comp_imu_weight = None
+            self.real_comp_odom_weight = None
         else:
             self.world_frame = "odom"
             self.base_footprint_frame = "base_footprint"
@@ -57,6 +63,11 @@ class GraphSlam(Node):
             # On real robot, keep robot stack as TF authority and publish SLAM odometry on separate topic.
             self.odom_topic = "/turtlebot/odom_graph_slam"
             self.publish_tf = False
+            # Stronger fixed heading prior for real robot turns.
+            self.real_imu_heading_sigma = float(np.deg2rad(1.0))
+            # For LiDAR rotational compensation in real mode, trust IMU strongly.
+            self.real_comp_imu_weight = 0.99
+            self.real_comp_odom_weight = 0.01
 
         # Initialize parameters of the robot
         self.base_length = 0.23
@@ -74,6 +85,16 @@ class GraphSlam(Node):
         self.joint_states_sub = self.create_subscription(JointState, "/turtlebot/joint_states", self.joint_state_callback, 20)
         self.imu_sub = self.create_subscription(Imu, imu_topic, self.recieve_imu, 20)
         self.lidar_sub = self.create_subscription(LaserScan, "/turtlebot/scan", self.receive_lidar, 20)
+        if self.mode == 'real':
+            self.robot_odom_sub = self.create_subscription(Odometry, "/turtlebot/odom", self.receive_robot_odom, 20)
+            self.robot_odom_pose = None
+            self.tf_buffer = Buffer()
+            self.tf_listener = TransformListener(self.tf_buffer, self)
+        else:
+            self.robot_odom_sub = None
+            self.robot_odom_pose = None
+            self.tf_buffer = None
+            self.tf_listener = None
         self.odom_pub = self.create_publisher(Odometry, self.odom_topic, 20)
         if self.publish_ground_truth_enu:
             self.odom_ground_truth = self.create_subscription(Odometry, odom_ground_truth_topic, self.recieve_odom_ground_truth, 20)
@@ -135,7 +156,7 @@ class GraphSlam(Node):
         if self.mode == 'sim':
             self.line_extractor = SplitAndMerge(0.01, True, True)
         else:
-            self.line_extractor = SplitAndMerge(0.01, False, False)
+            self.line_extractor = SplitAndMerge(0.1, False, False)
         self.polar_coordinates = []
         self.polar_covariances = []
 
@@ -147,11 +168,15 @@ class GraphSlam(Node):
 
         # Data association initialize
         self.H = []
-        self.confidence_level = 0.95
+        self.confidence_level = 0.99 # simulation 0.95
         self.data_association = None
 
         # Initialize time accumulate
         self.time_accumulate = 0.0
+        # Latest body velocities (used for LiDAR motion compensation).
+        self.linear_velocity = 0.0
+        self.angular_velocity = 0.0
+        self.imu_gyro_z = 0.0
 
     # Function receive imu infomation data
     def recieve_imu(self, msg):
@@ -166,7 +191,9 @@ class GraphSlam(Node):
 
         # Convert quaternion to Euler angles and extract yaw (theta)
         self.imu_orientation = euler_from_quaternion(orientation_used[0], orientation_used[1], orientation_used[2], orientation_used[3])[2]  # Adjust for initial orientation
-        self.imu_covariance = np.array([[cov_orientation[8]]])  # Assuming covariance for yaw is at index 8
+        self.imu_gyro_z = float(msg.angular_velocity.z)
+        # self.imu_covariance = np.array([[cov_orientation[8]]])  # Assuming covariance for yaw is at index 8
+        self.imu_covariance = np.array([[0.05]]) # Real robot
         self.imu_update_flag = True
 
         # Store IMU data in buffer
@@ -183,7 +210,14 @@ class GraphSlam(Node):
     # Function receive lidar information data
     def receive_lidar(self, msg):
         # Transform lidar range and angle data to Cartesian coordinates and extract line segments
-        lidar_points = self.line_extractor.transform_lidar_to_cartesian(msg)
+        if self.mode == 'real':
+            lidar_points = self._transform_lidar_to_base_frame(msg)
+            if lidar_points is None:
+                return
+        else:
+            lidar_points = self.line_extractor.transform_lidar_to_cartesian(
+                msg, v=self.linear_velocity, omega=self._get_lidar_comp_omega()
+            )
         line_segments = []
         line_segments = self.line_extractor.split(lidar_points, line_segments)
         line_segments = self.line_extractor.merge(line_segments)
@@ -216,6 +250,83 @@ class GraphSlam(Node):
         # Debug log
         # for i, polar_coordinate in enumerate(polar_coordinates):
         #     self.get_logger().info(f"Received line feature {i}: range {polar_coordinate[0]}, angle {polar_coordinate[1]}")
+
+    def receive_robot_odom(self, msg):
+        q_x = msg.pose.pose.orientation.x
+        q_y = msg.pose.pose.orientation.y
+        q_z = msg.pose.pose.orientation.z
+        q_w = msg.pose.pose.orientation.w
+        _, _, theta = euler_from_quaternion(q_x, q_y, q_z, q_w)
+        self.robot_odom_pose = np.array([msg.pose.pose.position.x, msg.pose.pose.position.y, theta], dtype=float)
+
+    def _transform_lidar_to_base_frame(self, lidar_msg):
+        lidar_points_sensor = []
+        comp_omega = self._get_lidar_comp_omega()
+        time_inc = lidar_msg.time_increment
+        if time_inc <= 0.0 and lidar_msg.scan_time > 0.0 and len(lidar_msg.ranges) > 0:
+            time_inc = lidar_msg.scan_time / len(lidar_msg.ranges)
+        apply_distortion = time_inc > 0.0 and (abs(comp_omega) > 1e-6 or abs(self.linear_velocity) > 1e-6)
+
+        current_angle = lidar_msg.angle_min
+        for i, lidar_range in enumerate(lidar_msg.ranges):
+            if math.isinf(lidar_range):
+                current_angle += lidar_msg.angle_increment
+                continue
+            x_raw = np.cos(current_angle) * lidar_range
+            y_raw = np.sin(current_angle) * lidar_range
+            current_angle += lidar_msg.angle_increment
+            if apply_distortion:
+                t_i = i * time_inc
+                dtheta_i = comp_omega * t_i
+                if abs(comp_omega) > 1e-5:
+                    dx_w = (self.linear_velocity / comp_omega) * math.sin(dtheta_i)
+                    dy_w = (self.linear_velocity / comp_omega) * (1.0 - math.cos(dtheta_i))
+                else:
+                    dx_w = self.linear_velocity * t_i
+                    dy_w = 0.0
+                c = math.cos(dtheta_i)
+                s = math.sin(dtheta_i)
+                x_point = c * x_raw - s * y_raw + dx_w
+                y_point = s * x_raw + c * y_raw + dy_w
+            else:
+                x_point = x_raw
+                y_point = y_raw
+            lidar_points_sensor.append(np.array([x_point, y_point], dtype=float))
+
+        try:
+            tf_msg = self.tf_buffer.lookup_transform(
+                self.base_footprint_frame,
+                lidar_msg.header.frame_id,
+                Time.from_msg(lidar_msg.header.stamp),
+            )
+        except TransformException as exc:
+            if not self._real_tf_warned:
+                self.get_logger().warn(
+                    f"Skipping LiDAR frame: no TF {lidar_msg.header.frame_id} -> {self.base_footprint_frame}: {exc}"
+                )
+                self._real_tf_warned = True
+            return None
+
+        tx = tf_msg.transform.translation.x
+        ty = tf_msg.transform.translation.y
+        q = tf_msg.transform.rotation
+        _, _, yaw = euler_from_quaternion(q.x, q.y, q.z, q.w)
+        c = math.cos(yaw)
+        s = math.sin(yaw)
+        rotation = np.array([[c, -s], [s, c]])
+        translation = np.array([tx, ty], dtype=float)
+
+        lidar_points_base = []
+        for point_sensor in lidar_points_sensor:
+            point_base = rotation @ point_sensor + translation
+            lidar_points_base.append(point_base)
+
+        return lidar_points_base
+
+    def _get_lidar_comp_omega(self) -> float:
+        if self.mode != 'real':
+            return self.angular_velocity
+        return (self.real_comp_imu_weight * self.imu_gyro_z) + (self.real_comp_odom_weight * self.angular_velocity)
     
     # Define motion model
     def f(self, wheel_velocity, dt):
@@ -399,7 +510,10 @@ class GraphSlam(Node):
         self.i += 1
         rel_pos = gtsam.Pose2(self.rel_disp[0,0], self.rel_disp[1,0], self.rel_disp[2,0])
         OdometryNoise = gtsam.noiseModel.Gaussian.Covariance(self.rel_cov + 1e-7 * np.identity(3))  # Adding a small value to prevent zero covariance
-        sigma_heading = float(np.sqrt(Rk[0,0] + 1e-7))  # Adding a small value to prevent zero covariance
+        if self.mode == 'real':
+            sigma_heading = self.real_imu_heading_sigma
+        else:
+            sigma_heading = float(np.sqrt(Rk[0,0] + 1e-7))  # Adding a small value to prevent zero covariance
         pose_key_prev = gtsam.symbol('X', self.i-1)
         pose_key_curr = gtsam.symbol('X', self.i)
         self.graph.add(gtsam.BetweenFactorPose2(pose_key_prev, pose_key_curr, rel_pos, OdometryNoise))
@@ -486,9 +600,23 @@ class GraphSlam(Node):
             self.last_time = current_time
             PriorNoise = gtsam.noiseModel.Diagonal.Sigmas(np.zeros(3) + 1e-7)
             pose_key = gtsam.symbol('X', self.i)
-            self.graph.add(gtsam.PriorFactorPose2(pose_key, gtsam.Pose2(0, 0, self.theta), PriorNoise))
+            if self.mode == 'real' and self.robot_odom_pose is not None:
+                prior_x = float(self.robot_odom_pose[0])
+                prior_y = float(self.robot_odom_pose[1])
+                prior_theta = float(self.robot_odom_pose[2])
+                self.x = prior_x
+                self.y = prior_y
+                self.theta = prior_theta
+            else:
+                prior_x = 0.0
+                prior_y = 0.0
+                prior_theta = self.theta
+                if self.mode == 'real' and not self._real_odom_init_warned:
+                    self.get_logger().warn("Real mode started without /turtlebot/odom seed; using zero pose prior.")
+                    self._real_odom_init_warned = True
+            self.graph.add(gtsam.PriorFactorPose2(pose_key, gtsam.Pose2(prior_x, prior_y, prior_theta), PriorNoise))
             self.initial = gtsam.Values()
-            self.initial.insert(pose_key, gtsam.Pose2(0, 0, self.theta))
+            self.initial.insert(pose_key, gtsam.Pose2(prior_x, prior_y, prior_theta))
             return
 
         dt = (current_time - self.last_time).nanoseconds / 1e9
@@ -519,9 +647,12 @@ class GraphSlam(Node):
             right_wheel_velocity = msg.velocity[1]
 
         # Adding noise to the wheel encoder sensor
+        self.linear_velocity = 0.5 * self.radius_wheel * (left_wheel_velocity + right_wheel_velocity)
+        self.angular_velocity = (self.radius_wheel / self.base_length) * (-left_wheel_velocity + right_wheel_velocity)
         wheel_velocity = np.array([[left_wheel_velocity], [right_wheel_velocity]]) # + np.random.normal(np.zeros((2,1)), np.array([np.sqrt(self.covariance_wheel_encoder.diagonal())]).T)
 
         current_time_in_sec = current_time.nanoseconds / 1e9
+        lidar_timestamp = current_time_in_sec
         # Try to synchronize the latest IMU and LiDAR data with the current joint state data
         if self.imu_update_flag and len(self.imu_time_buffer) > 0:
             while len(self.imu_time_buffer) > 0 and abs(self.imu_time_buffer[0] - current_time_in_sec) > 0.01:
@@ -543,8 +674,20 @@ class GraphSlam(Node):
                 self.polar_coordinates = self.line_buffer[0][0]
                 self.polar_covariances = self.line_buffer[0][1]
                 self.line_segments = self.line_buffer[0][2]
+                lidar_timestamp = self.line_time_buffer[0]
             else:
                 self.lidar_update_flag = False
+
+        # Compensate line feature angles for scan->processing delay under rotation.
+        comp_omega = self._get_lidar_comp_omega()
+        if self.lidar_update_flag and abs(comp_omega) > 1e-6:
+            dt_delay = current_time_in_sec - lidar_timestamp
+            if dt_delay > 0.0:
+                alpha_correction = -comp_omega * dt_delay
+                self.polar_coordinates = [
+                    [pc[0], warp_angle(pc[1] + alpha_correction)]
+                    for pc in self.polar_coordinates
+                ]
 
         # Predict pose of robot with covariance
         xk_bar, Pk_bar = self.Prediction(wheel_velocity, dt)

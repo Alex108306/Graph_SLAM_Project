@@ -5,3 +5,12 @@ log/
 localization_graph_slam/realrobotinfos.txt
 localization_graph_slam_mine.zip
 localization_graph_slam/__pycache__/
+
+
+localization_debug/
+localization_graph_slam/2026-05-14-11-36-23_localization/
+localization_graph_slam/localization_debug.zip
+localization_graph_slam/localization_debug/
+localization_graph_slam_fr.zip
+# localization_graph_slam/localization_graph_slam/__pycache__/
+# localization_graph_slam/localization_graph_slam/__pycache__/
