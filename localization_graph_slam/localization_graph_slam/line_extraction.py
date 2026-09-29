@@ -12,44 +12,60 @@ from scipy.linalg import block_diag
 from .utils import warp_angle
 
 class SplitAndMerge:
-    def __init__(self, distance_threshold: float, lidar_flip_pi: bool = True, decrement_angle: bool = True):
+    def __init__(self, distance_threshold: float, mode: str,
+                 min_points: int = 20,
+                 merge_angle_threshold: float = math.radians(10.0),
+                 merge_distance_threshold: float = 0.10,
+                 measurement_sigma_r: float = 0.2):
         self.distance_threshold = distance_threshold
-        self.lidar_flip_pi = lidar_flip_pi
-        self.decrement_angle = decrement_angle
-    
+        self.mode = mode
+        self.min_points = min_points
+        self.merge_angle_threshold = merge_angle_threshold
+        self.merge_distance_threshold = merge_distance_threshold
+        self.measurement_sigma_r = measurement_sigma_r
+
     def transform_lidar_to_cartesian(self, lidar_msg):
         """
-        Transform lidar from Polar cooridnates to Catersian coordinates
+        Transform lidar from Polar coordinates to Cartesian coordinates, with optional
+        scan motion de-distortion for a robot moving at linear velocity v and angular
+        velocity omega during the scan.
 
-        Args: 
+        Args:
             lidar_msg: lidar message received from /turtlebot/scan topic
-        
+            v: robot linear velocity (m/s) at scan time
+            omega: robot angular velocity (rad/s) at scan time
+
         Return:
-            List of array points in 2D Catersian coordinate (x,y)
+            List of array points in 2D Cartesian coordinate (x,y), referred to the
+            robot body frame at scan-start time.
         """
         lidar_points = []
         lidar_range = lidar_msg.ranges
         angle_increment = lidar_msg.angle_increment
-        if self.lidar_flip_pi:
-            angle_min = lidar_msg.angle_min + math.pi  # Rotating 180 degree to align with robot local frame.
+        if self.mode == 'sim':
+            angle_min = lidar_msg.angle_min + math.pi  # 180° rotation to align with robot local frame
         else:
-            angle_min = lidar_msg.angle_min
+            angle_min = lidar_msg.angle_min + math.pi/2
         current_angle = angle_min
+
         for i in range(len(lidar_range)):
             if math.isinf(lidar_range[i]):
-                if self.decrement_angle:
+                if self.mode == 'sim':
                     current_angle -= angle_increment
                 else:
                     current_angle += angle_increment
                 continue
-            x_point = np.cos(current_angle) * lidar_range[i]
-            y_point = np.sin(current_angle) * lidar_range[i]
-            if self.decrement_angle:
+            x_raw = math.cos(current_angle) * lidar_range[i]
+            y_raw = math.sin(current_angle) * lidar_range[i]
+            if self.mode == 'sim':
                 current_angle -= angle_increment
             else:
                 current_angle += angle_increment
+
+            x_point, y_point = x_raw, y_raw
+
             lidar_points.append(np.array([x_point, y_point]))
-        
+
         return lidar_points
     
     def fit_line(self, point1: np.array, point2: np.array) -> tuple:
@@ -96,8 +112,8 @@ class SplitAndMerge:
             List of line segments, where each line segment is represented by a tuple of two points (start_point, end_point)
         """
 
-        # If the number of points is less than or equal to 15, we consider it is not a line
-        if len(list_of_points) <= 15:
+        # If the number of points is less than or equal to threshold, we consider it is not a line
+        if len(list_of_points) <= self.min_points:
             return line_segments
 
         start_point = list_of_points[0]
@@ -137,24 +153,48 @@ class SplitAndMerge:
             List of merged line segments
         """
 
-        angle_approve_merge = 0.087  # 5 degrees in radians
-        distance_threshold_between_lines = 0.05  # 5 cm
+        angle_approve_merge = self.merge_angle_threshold
+        distance_threshold_between_lines = self.merge_distance_threshold
+
+        def line_signed_params(line):
+            a, b, c = self.fit_line(line[0], line[1])
+            norm = math.hypot(a, b)
+            if norm < 1e-9:
+                return None
+            rho = -c / norm
+            alpha = math.atan2(b, a)
+            if rho < 0:
+                rho = -rho
+                alpha = warp_angle(alpha + math.pi)
+            return rho, alpha
 
         def can_merge(line_1, line_2):
-            line_1_params = self.fit_line(line_1[0], line_1[1])
-            line_2_params = self.fit_line(line_2[0], line_2[1])
-
-            distance_line_1 = self.distance_from_line([0.0, 0.0], line_1_params)
-            distance_line_2 = self.distance_from_line([0.0, 0.0], line_2_params)
-            diff_distance = abs(distance_line_1 - distance_line_2)
-            if diff_distance >= distance_threshold_between_lines:
+            p1 = line_signed_params(line_1)
+            p2 = line_signed_params(line_2)
+            if p1 is None or p2 is None:
                 return False
-
-            angle_1 = math.atan2(line_1_params[1], line_1_params[0])
-            angle_2 = math.atan2(line_2_params[1], line_2_params[0])
-            angle_diff = abs(math.atan2(math.sin(angle_1 - angle_2), math.cos(angle_1 - angle_2)))
-
+            rho1, alpha1 = p1
+            rho2, alpha2 = p2
+            if abs(rho1 - rho2) >= distance_threshold_between_lines:
+                return False
+            angle_diff = abs(warp_angle(alpha1 - alpha2))
             return angle_diff < angle_approve_merge
+
+        def fuse(line_1, line_2):
+            # Project all four endpoints onto the dominant direction and keep the extremes.
+            pts = [np.asarray(p, dtype=float) for p in (line_1[0], line_1[1], line_2[0], line_2[1])]
+            v = pts[1] - pts[0]
+            n = np.linalg.norm(v)
+            if n < 1e-9:
+                v = pts[3] - pts[2]
+                n = np.linalg.norm(v)
+                if n < 1e-9:
+                    return line_1
+            direction = v / n
+            projections = [float(np.dot(p, direction)) for p in pts]
+            i_min = int(np.argmin(projections))
+            i_max = int(np.argmax(projections))
+            return [pts[i_min], pts[i_max]]
 
         if len(line_segments) <= 1:
             return line_segments
@@ -163,26 +203,24 @@ class SplitAndMerge:
 
         while True:
             changed = False
+            n = len(current_segments)
+            used = [False] * n
             merged_segments = []
-            i = 0
-
-            while i < len(current_segments):
-                if i < len(current_segments) - 1 and can_merge(current_segments[i], current_segments[i + 1]):
-                    merged_segments.append([current_segments[i][0], current_segments[i + 1][1]])
-                    changed = True
-                    i += 2
-                else:
-                    merged_segments.append(current_segments[i])
-                    i += 1
-
-            # Optional closed-loop merge: merge last and first if they are compatible
-            if len(merged_segments) > 1 and can_merge(merged_segments[-1], merged_segments[0]):
-                merged_segments[0] = [merged_segments[-1][0], merged_segments[0][1]]
-                merged_segments.pop()
-                changed = True
+            for i in range(n):
+                if used[i]:
+                    continue
+                base = current_segments[i]
+                for j in range(i + 1, n):
+                    if used[j]:
+                        continue
+                    if can_merge(base, current_segments[j]):
+                        base = fuse(base, current_segments[j])
+                        used[j] = True
+                        changed = True
+                merged_segments.append(base)
+                used[i] = True
 
             current_segments = merged_segments
-
             if not changed:
                 break
 
@@ -202,7 +240,10 @@ class SplitAndMerge:
         for i, line in enumerate(line_segments):
             line_params = self.fit_line(line[0], line[1])
             distance = self.distance_from_line([0.0, 0.0], line_params)
-            angle = warp_angle(math.atan2(line_params[1], line_params[0]) - np.pi)
+            if self.mode == 'sim':
+                angle = warp_angle(math.atan2(line_params[1], line_params[0]) - np.pi)
+            else:
+                angle = warp_angle(math.atan2(line_params[1], line_params[0]))
             polar_coordinates.append([distance, angle])
 
         return polar_coordinates
@@ -215,7 +256,7 @@ class SplitAndMerge:
         Return:
             Covariance matrix of the line segment with respect to the robot local frame
         """
-        sigma_r = 0.07 # 30 cm
+        sigma_r = self.measurement_sigma_r
         cov_max_2D_point = np.array([[sigma_r**2, 0.0], [0.0, sigma_r**2]])
 
         line_params = self.fit_line(line[0], line[1])
@@ -246,27 +287,14 @@ class LineExtractionNode(Node):
     def __init__(self):
         super().__init__('extract_line')
 
-        self.declare_parameter('mode', 'sim')
-        self.mode = self.get_parameter('mode').get_parameter_value().string_value.lower()
-        if self.mode not in ['sim', 'real']:
-            self.get_logger().warn(f"Unknown mode '{self.mode}', fallback to 'sim'.")
-            self.mode = 'sim'
-
-        if self.mode == 'sim':
-            self.lidar_coordinate = "turtlebot/base_footprint"
-            self.lidar_flip_pi = True
-            self.lidar_decrement_angle = True
-        else:
-            self.lidar_coordinate = "base_footprint"
-            self.lidar_flip_pi = False
-            self.lidar_decrement_angle = False
-
         self.laser_sub_ = self.create_subscription(LaserScan, '/turtlebot/scan', self.receive_lidar_scan, 20)
         self.marker_array_pub_ = self.create_publisher(MarkerArray, '/turtlebot/scan_points', 20)
-        self.line_array_pub_ = self.create_publisher(MarkerArray, '/turtlebot/line_segments', 20)
+        self.line_array_pub_ = self.create_publisher(MarkerArray, '/turtlebot/line_segments_base_frame', 20)
         self.create_timer(0.5, self.visualize_lidar_points)
         self.create_timer(0.5, self.visualize_line_segments)
         self.lidar_points = None
+        self.lidar_coordinate = "base_footprint"
+        self.lidar_msg = None
     
     def transform_lidar_to_cartesian(self, lidar_msg):
         """
@@ -281,24 +309,15 @@ class LineExtractionNode(Node):
         lidar_points = []
         lidar_range = lidar_msg.ranges
         angle_increment = lidar_msg.angle_increment
-        if self.lidar_flip_pi:
-            angle_min = lidar_msg.angle_min + math.pi  # Rotating 180 degree to align with robot local frame.
-        else:
-            angle_min = lidar_msg.angle_min
+        angle_min = lidar_msg.angle_min + math.pi/2 # Rotating 180 degree to align with robot local frame 
         current_angle = angle_min
         for i in range(len(lidar_range)):
             if math.isinf(lidar_range[i]):
-                if self.lidar_decrement_angle:
-                    current_angle -= angle_increment
-                else:
-                    current_angle += angle_increment
+                current_angle += angle_increment
                 continue
             x_point = np.cos(current_angle) * lidar_range[i]
             y_point = np.sin(current_angle) * lidar_range[i]
-            if self.lidar_decrement_angle:
-                current_angle -= angle_increment
-            else:
-                current_angle += angle_increment
+            current_angle += angle_increment
             lidar_points.append(np.array([x_point, y_point]))
         
         return lidar_points
@@ -313,6 +332,7 @@ class LineExtractionNode(Node):
             List of array points in 2D Catersian coordinate (x,y)
         """
         lidar_msg = msg
+        self.lidar_msg = msg
         self.lidar_points = self.transform_lidar_to_cartesian(lidar_msg)
 
     def visualize_lidar_points(self):
@@ -327,7 +347,7 @@ class LineExtractionNode(Node):
         for i, point in enumerate(self.lidar_points):
             marker = Marker()
             marker.header.frame_id = self.lidar_coordinate
-            marker.header.stamp = self.get_clock().now().to_msg()
+            marker.header.stamp = self.lidar_msg.header.stamp
             marker.ns = "lidar_points"
             marker.id = i
             marker.type = Marker.SPHERE
@@ -359,20 +379,19 @@ class LineExtractionNode(Node):
             return
 
         # Extract line segments from lidar points using Split and Merge algorithm
-        split_and_merge = SplitAndMerge(0.01, self.lidar_flip_pi, self.lidar_decrement_angle)
+        split_and_merge = SplitAndMerge(0.03, mode='real')
         line_segments = []
         line_segments = split_and_merge.split(self.lidar_points, line_segments)
         line_segments = split_and_merge.merge(line_segments)
 
         polar_coordinates = split_and_merge.calculate_polar_coordinates(line_segments)
         angle_list = [polar[1] for polar in polar_coordinates]
-        self.get_logger().info(f"{angle_list}")
         
         lines_visualization = MarkerArray()
         for i, line in enumerate(line_segments):
             marker = Marker()
             marker.header.frame_id = self.lidar_coordinate
-            marker.header.stamp = self.get_clock().now().to_msg()
+            marker.header.stamp = self.lidar_msg.header.stamp
             marker.ns = "line_segments"
             marker.id = i
             marker.type = Marker.LINE_STRIP
@@ -391,7 +410,6 @@ class LineExtractionNode(Node):
         
             cov_line = split_and_merge.calculate_covariance_matrix([start_point, end_point])
             sigma_r = math.sqrt(cov_line[0, 0])
-            # self.get_logger().info(f"Line {i}: sigma_r = {sigma_r}, sigma_theta = {math.sqrt(cov_line[1, 1])}")
             sigma_theta = math.sqrt(cov_line[1, 1])
 
             dx = end_point[0] - start_point[0]

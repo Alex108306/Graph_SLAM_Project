@@ -5,14 +5,38 @@ from .utils import warp_angle
 
 class DataAssociation:
 
-    def __init__(self, confidenve_level, map_feature, map_feature_cov, line_segments_map):
+    def __init__(self, confidence_level, map_feature, map_feature_cov, line_segments_map,
+                 duplicate_rho_threshold: float = 0.2,
+                 duplicate_alpha_threshold: float = 0.2,
+                 measurement_sigma_rho_floor: float = 0.04,
+                 measurement_sigma_alpha_floor: float = 0.06):
 
-        self.confidenve_level = confidenve_level
+        self.confidence_level = confidence_level
         self.map_feature = map_feature
         self.map_feature_cov = map_feature_cov
         self.map_line_segments = line_segments_map  # Initialize an empty list for line segments
         self.nf = len(map_feature)
         self.zfi_dim = 2
+
+        self.duplicate_rho_threshold = duplicate_rho_threshold
+        self.duplicate_alpha_threshold = duplicate_alpha_threshold
+        self.measurement_sigma_rho_floor = measurement_sigma_rho_floor
+        self.measurement_sigma_alpha_floor = measurement_sigma_alpha_floor
+
+    def SafeCovariance(self, cov, dim=2, apply_polar_floor=True):
+        cov = np.asarray(cov, dtype=float)
+
+        if cov.shape != (dim, dim):
+            cov = np.eye(dim) * 0.05
+
+        cov = 0.5 * (cov + cov.T)
+        cov += np.eye(dim) * 1e-9
+
+        if dim == 2 and apply_polar_floor:
+            cov[0, 0] = max(cov[0, 0], self.measurement_sigma_rho_floor**2)
+            cov[1, 1] = max(cov[1, 1], self.measurement_sigma_alpha_floor**2)
+
+        return cov
 
     
     def SquaredMahalanobisDistance(self, hfj, Pfj, zfi, Rfi):
@@ -64,22 +88,62 @@ class DataAssociation:
         """
 
         H = []
-        for i in range(len(zf)):
-            zfi= zf[i]
-            Rfi = Rf[i]
-            nearest_feature = None
-            D2_min = np.inf
-            for j in range(len(hf)):
-                hfi = hf[j]
-                Phfi = Phf[j]
-                D2_ij = self.SquaredMahalanobisDistance(hfi, Phfi, zfi, Rfi)
-                if self.IndividualCompatibility(D2_ij, dim, self.confidenve_level) and D2_ij < D2_min:
-                    nearest_feature = j
-                    D2_min = D2_ij
+        n_obs = len(zf)
+        n_map = len(hf)
 
-            H.append(nearest_feature)
+        H = [None for _ in range(n_obs)]
+
+        if n_obs == 0 and n_map == 0:
+            return H
+        
+        D = np.full((n_obs, n_map), np.inf, dtype=float)
+        C = np.zeros((n_obs, n_map), dtype=bool)
+
+        raw_nearest =[]
+
+        for i in range(n_obs):
+            best_feature = None
+            least_dist = np.inf
+            for j in range(n_map):
+                D2_ij = self.SquaredMahalanobisDistance(hf[j], Phf[j], zf[i], Rf[i])
+
+                D[i, j] = D2_ij
+
+                if self.IndividualCompatibility(D2_ij, dim, self.confidence_level):
+                    C[i, j] = True
+
+                    if D2_ij < least_dist:
+                        least_dist = D2_ij
+                        best_feature = j 
+            
+            raw_nearest.append(best_feature)
+        
+        compatible_pairs = []
+
+        for i in range(n_obs):
+            for j in range(n_map):
+                if C[i, j]:
+                    compatible_pairs.append((D[i, j], i, j))
+
+        compatible_pairs.sort(key=lambda item: item[0])
+
+        assigned_observations = set()
+        assigned_landmarks = set()
+
+        for _, i, j in compatible_pairs:
+            if i in assigned_observations:
+                continue
+
+            if j in assigned_landmarks:
+                continue
+
+            H[i] = j
+            assigned_observations.add(i)
+            assigned_landmarks.add(j)
+
 
         return H
+
     
     def DataAssociation(self, xk, Pk, zf, Rf):
         """
@@ -110,12 +174,22 @@ class DataAssociation:
             Pf_map = self.map_feature_cov[i]
 
             P_Fi = Jx @ Pk @ Jx.T + Jf @ Pf_map @ Jf.T
-            P_Fi = 0.5 * (P_Fi + P_Fi.T) + 1e-9 * np.eye(2)
-            # P_Fi = self.Jhfjx(xk, i) @ Pk @ self.Jhfjx(xk ,i).T
+            P_Fi = self.SafeCovariance(P_Fi, dim=2, apply_polar_floor=False)
             h_F.append(h_Fi)
             P_F.append(P_Fi)
 
         H = self.ICNN(h_F, P_F, zf, Rf, self.zfi_dim)
+
+        for i in range(len(zf)):
+            if H[i] is not None:
+                continue
+                
+            candidate_feature = self.TransformObservationToWorldFeatureFrame(xk, zf[i])
+
+            duplicate_id = self.find_geometry_duplicate(candidate_feature)
+
+            if duplicate_id is not None:
+                H[i] = duplicate_id
 
         return H
     
@@ -145,9 +219,7 @@ class DataAssociation:
         :return: Jacobian matrix of the expected feature observation :math:`h_{f_j}` with respect to the state vector :math:`x_k`
         """
         # Implement Jacobian of the sensor model
-        range_f = self.map_feature[j][0]
         theta_f = self.map_feature[j][1]
-        x_robot, y_robot, theta_robot = xk[0][0], xk[1][0], xk[2][0]
         Jhfjx = np.array([[-cos(theta_f), -sin(theta_f), 0],
                           [0, 0, -1]])
 
@@ -178,6 +250,57 @@ class DataAssociation:
         line_segment_world = R @ line_segment + np.array([[x_robot], [y_robot]])
         line_segment_world = [[line_segment_world[0, 0], line_segment_world[1, 0]], [line_segment_world[0, 1], line_segment_world[1, 1]]]  # Reshape back to list of tuples
         return line_segment_world  # Flatten to a 1D list and convert to Python list
+
+    def TransformObservationToWorldFeatureFrame(self, xk, zfi):
+        x_robot, y_robot, theta_robot = xk[0][0], xk[1][0], xk[2][0]
+        range_obs = zfi[0]
+        theta_obs = zfi[1]
+        range_f = range_obs + cos(theta_obs + theta_robot) * x_robot + sin(theta_obs + theta_robot) * y_robot
+        theta_f = warp_angle(theta_obs + theta_robot)
+        return np.array([range_f, theta_f])
+    
+    def _feature_geometry_score(self, candidate, feature):
+        rho_c = float(candidate[0])
+        alpha_c = float(candidate[1])
+
+        rho_f = float(feature[0])
+        alpha_f = float(feature[1])
+
+        rho_error = abs(rho_c - rho_f)
+        alpha_error = abs(warp_angle(alpha_c - alpha_f))
+
+        if rho_error > self.duplicate_rho_threshold:
+            return None
+
+        if alpha_error > self.duplicate_alpha_threshold:
+            return None
+
+        score = (
+            rho_error / max(self.duplicate_rho_threshold, 1e-9)
+            + alpha_error / max(self.duplicate_alpha_threshold, 1e-9)
+        )
+
+        return float(score)
+
+    def find_geometry_duplicate(self, candidate_feature):
+        if len(self.map_feature) == 0:
+            return None
+
+        best_j = None
+        best_score = np.inf
+
+        for j, feature in enumerate(self.map_feature):
+            score = self._feature_geometry_score(candidate_feature, feature)
+
+            if score is None:
+                continue
+
+            if score < best_score:
+                best_score = score
+                best_j = j
+
+        return best_j
+
     
     def AddNewFeature(self, xk, Pk, zfi, Rfi, line_segment):
         """

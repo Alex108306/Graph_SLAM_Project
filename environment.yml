@@ -1,0 +1,15 @@
+name: IFROS_localization
+channels:
+  - defaults
+dependencies:
+  - python=3.12        # must match the ROS 2 Jazzy system Python
+  - pip
+  - pip:
+      - gtsam==4.3a0
+      - numpy==1.26.4  # ROS 2 Jazzy is built against NumPy 1.x
+      - scipy
+      - matplotlib
+      - pyyaml
+      - catkin_pkg     # needed by colcon / ament when building
+      - empy==3.3.4    # rosidl needs empy 3.x (4.x breaks the build)
+      - lark
